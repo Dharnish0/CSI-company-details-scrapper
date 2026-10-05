@@ -16,6 +16,8 @@ class RelationshipAgent(BaseAgent[RelationshipInput, RelationshipOutput]):
     input_model = RelationshipInput
     output_model = RelationshipOutput
     max_output_tokens = 3000
+    allowed_tools = {"get_page_excerpt": 2}  # 20.3: read-only, cap 2 per invocation
+    max_tool_calls = 2
 
     def system_prompt(self) -> str:
         return RELATIONSHIP_V1

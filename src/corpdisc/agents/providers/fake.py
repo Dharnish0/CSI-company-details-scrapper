@@ -82,6 +82,8 @@ class HandlerProvider:
     def complete(self, request: ProviderRequest) -> ProviderResponse:
         self.requests.append(request)
         out = self._handler(request)
+        if isinstance(out, ToolCalls):
+            return ProviderResponse(content=None, tool_calls=out.calls, usage=self._usage, model=self._model)
         if isinstance(out, BaseModel):
             out = out.model_dump_json()
         elif isinstance(out, dict):

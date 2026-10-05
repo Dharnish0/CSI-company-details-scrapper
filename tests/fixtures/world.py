@@ -17,6 +17,7 @@ from corpdisc.db.repos.audit import SqliteAuditSink, SqliteResponseCache
 from corpdisc.db.repos.pages import PageRepo
 from corpdisc.db.repos.runs import RunRepo
 from corpdisc.graphs.deps import ResearchDeps
+from corpdisc.graphs.tools import make_page_excerpt_spec
 from corpdisc.graphs.supervisor import Supervisor, init_run
 from corpdisc.services.budget import BudgetGuard, BudgetLimits
 from corpdisc.services.committer import Committer
@@ -93,7 +94,7 @@ def build_world(tmp_path: Path, *, conn=None, http=None, brain=None, settings_kw
                          breaker=CircuitBreaker(breaker_threshold), budget=budget, clock=clock, sleeper=clock)
     audit = SqliteAuditSink(conn)
     runner = AgentRunner(gateway=gateway, audit=audit, cache=SqliteResponseCache(conn), budget=budget,
-                         broker=ToolBroker([], audit=audit, clock=clock, budget=budget),
+                         broker=ToolBroker([make_page_excerpt_spec(pages, cache, run_id)], audit=audit, clock=clock, budget=budget),
                          limits=RunnerLimits.from_settings(settings), clock=clock)
     verifier = QuoteVerifier()
     committer = Committer.from_settings(conn, run_id=run_id, page_text=make_page_text_loader(pages, cache),
