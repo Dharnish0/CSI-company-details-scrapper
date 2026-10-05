@@ -12,12 +12,12 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[2] / "src" / "corpdisc"
 
 ALLOWED: dict[str, set[str]] = {
-    "models": set(), "clock": set(), "config": set(), "logging_setup": {"config"},
+    "models": set(), "clock": set(), "config": set(), "transport": set(), "logging_setup": {"config"},
     "contracts": {"models", "clock", "contracts"},
     "db": {"models", "contracts", "clock", "db"},
-    "services": {"models", "contracts", "clock", "config", "logging_setup", "db", "services"},
+    "services": {"models", "contracts", "clock", "config", "logging_setup", "db", "services", "transport"},
     "gates": {"models", "contracts", "clock", "config", "logging_setup", "services", "gates"},
-    "agents": {"models", "contracts", "clock", "config", "logging_setup", "agents"},
+    "agents": {"models", "contracts", "clock", "config", "logging_setup", "agents", "transport"},
 }
 AGENT_BANNED = {"sqlite3", "requests", "urllib", "urllib3", "http", "httpx", "socket", "ssl", "playwright", "bs4",
                 "os", "pathlib", "io", "shutil", "tempfile", "glob"}

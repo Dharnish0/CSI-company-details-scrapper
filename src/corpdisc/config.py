@@ -96,6 +96,12 @@ class Settings(BaseSettings):
     llm_backoff_max_seconds: float = Field(default=30.0, ge=0)
     llm_temperature: float = Field(default=0.0, ge=0, le=2)
     llm_cassette_dir: Path = Path("./.cache/llm_cassettes")
+    # M8 real providers
+    llm_timeout_seconds: float = Field(default=60.0, gt=0)
+    llm_base_url: str = ""
+    llm_price_in_per_mtok: float = Field(default=0.0, ge=0)
+    llm_price_out_per_mtok: float = Field(default=0.0, ge=0)
+    llm_record_to: Path | None = None  # also write every successful response to this JSONL cassette
     # M7 supporting agents (ARCHITECTURE 20.3)
     advisor_enabled: bool = True
     advisor_min_conf: float = Field(default=0.60, ge=0, le=1)
@@ -126,6 +132,11 @@ class Settings(BaseSettings):
         if isinstance(raw, str) and not raw.strip():
             return None
         return v
+
+    @field_validator("llm_record_to", mode="before")
+    @classmethod
+    def _blank_path_is_none(cls, v: Any) -> Any:
+        return None if isinstance(v, str) and not v.strip() else v
 
     @field_validator("llm_token_budget", mode="before")
     @classmethod

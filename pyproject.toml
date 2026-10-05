@@ -37,4 +37,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-markers = ["playwright: needs the playwright package and an installed chromium (skipped otherwise)"]
+markers = [
+    "playwright: needs the playwright package and an installed chromium (skipped otherwise)",
+    "live: calls a REAL LLM provider (billable). Deselected by default; run with: pytest tests/live -m live",
+    "live_site: crawls the REAL target site with a REAL LLM. Deselected by default; also needs CORPDISC_LIVE_SITE=1",
+]
+addopts = "-m 'not live and not live_site'"
