@@ -184,7 +184,7 @@ class Committer:
             eid = self._resolve(EntityRef(entity_id=u.entity_id), ent)
             sets, vals = [], []
             for col, val in (("verification_status", u.verification_status), ("confidence", u.confidence),
-                             ("entity_type", u.entity_type)):
+                             ("entity_type", u.entity_type), ("crawl_state", u.crawl_state)):
                 if val is not None:
                     sets.append(f"{col} = ?")
                     vals.append(val.value if hasattr(val, "value") else val)
@@ -303,6 +303,12 @@ class Committer:
                 "INSERT INTO gate_rejections (run_id, invocation_id, gate_code, item_ref, detail, created_at) "
                 "VALUES (?,?,?,?,?,?)", (self._run_id, g.invocation_id, g.gate_code, g.item_ref, g.detail, now))
             rej_ids.append(int(cur.lastrowid))
+
+        for f in plan.findings:
+            c.execute("INSERT INTO validation_findings (run_id, check_name, severity, entity_id, relationship_id, "
+                      "details, action_taken, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                      (self._run_id, f.check_name, f.severity, f.entity_id, f.relationship_id, f.details,
+                       f.action_taken, now))
 
         result = CommitResult(entity_ids=ent, website_ids=web, relationship_ids=rel, evidence_ids=tuple(ev_ids),
                               candidate_ids=tuple(cand_ids), review_ids=tuple(review_ids), task_ids=tuple(task_ids),

@@ -38,4 +38,4 @@ class GateRejectionRepo:
                 sql,
                 (run_id, invocation_id, gate_code, item_ref, detail, iso_utc(self._clock.now())),
             )
-            return cursor.lastrow_id or 0
+            return cursor.lastrowid or 0

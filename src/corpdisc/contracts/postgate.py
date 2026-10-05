@@ -68,6 +68,7 @@ class EntityUpdate(Strict):
     verification_status: VerificationStatus | None = None
     confidence: Conf | None = None
     entity_type: EntityType | None = None
+    crawl_state: CrawlState | None = None
 
 
 class AliasWrite(Strict):
@@ -159,6 +160,17 @@ class GateRejectionWrite(Strict):
     invocation_id: int | None = Field(default=None, ge=1)
 
 
+class FindingWrite(Strict):
+    """A validation_findings row (written only through the Committer)."""
+
+    check_name: str = Field(min_length=1, max_length=60)
+    severity: Literal["INFO", "WARN", "ERROR"]
+    entity_id: int | None = Field(default=None, ge=1)
+    relationship_id: int | None = Field(default=None, ge=1)
+    details: str = Field(min_length=1, max_length=500)
+    action_taken: str | None = Field(default=None, max_length=200)
+
+
 class CommitPlan(Strict):
     """One transaction. Built only by the runtime; never from raw agent output."""
 
@@ -174,6 +186,7 @@ class CommitPlan(Strict):
     review_items: tuple[ReviewItemWrite, ...] = ()
     enqueue: tuple[TaskWrite, ...] = ()
     gate_rejections: tuple[GateRejectionWrite, ...] = ()
+    findings: tuple[FindingWrite, ...] = ()
 
     @model_validator(mode="after")
     def _refs_resolve(self) -> CommitPlan:
