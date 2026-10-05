@@ -135,7 +135,8 @@ def test_404_maps_to_http_error_without_retry(make_env):
     e = make_env({f"{U}/nope": resp(f"{U}/nope", 404, "missing", ctype="text/plain")})
     r = e.fetch("/nope")
     assert (r.crawl_status, r.status_code, r.error_code) == (CrawlStatus.HTTP_ERROR, 404, "HTTP_404")
-    assert e.http.count(f"{U}/nope") == 1 and e.clock.sleeps == []
+    # The only sleep is the politeness wait after robots.txt (also a request to the host); no retry backoff.
+    assert e.http.count(f"{U}/nope") == 1 and e.clock.sleeps == [pytest.approx(CFG.request_delay)]
     assert e.pages.get_page(e.run_id, f"{U}/nope").error.startswith("HTTP_404")
     assert e.cache.get(f"{U}/nope") is None  # failures are never cached
 
@@ -144,7 +145,8 @@ def test_500_then_200_is_retried_with_backoff(make_env):
     e = make_env({f"{U}/flaky": [resp(f"{U}/flaky", 500, "e"), resp(f"{U}/flaky", 503, "e"), resp(f"{U}/flaky", 200, BODY)]})
     r = e.fetch("/flaky")
     assert r.ok and e.http.count(f"{U}/flaky") == 3
-    assert [s for s in e.clock.sleeps if s >= 1][:2] == [pytest.approx(1.0), pytest.approx(2.0)]
+    # politeness after robots.txt (2.0), backoff 1.0, politeness top-up to 2.0 (1.0), backoff 2.0
+    assert e.clock.sleeps == [pytest.approx(x) for x in (2.0, 1.0, 1.0, 2.0)]
     assert [t for t, _ in e.errors()] == ["HTTP_500", "HTTP_503"]  # every failed attempt is logged
 
 
@@ -324,7 +326,7 @@ def test_corrupt_cache_file_is_a_miss_and_refetches(make_env, tmp_path):
     e = make_env({f"{U}/p": resp(f"{U}/p", 200, BODY)})
     first = e.fetch("/p")
     row = e.pages.get_page_by_id(first.page_id)
-    (tmp_path / "cache" / row.text_path).write_text("tampered", encoding="utf-8")
+    (e.cache.directory.parent / row.text_path).write_text("tampered", encoding="utf-8")
     assert e.svc.load_text(first.page_id) is None  # verified read refuses corrupt text
     again = e.fetch("/p")
     assert again.ok and not again.cache_hit and e.http.count(f"{U}/p") == 2
