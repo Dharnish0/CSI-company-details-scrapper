@@ -118,9 +118,11 @@ def test_agents_contract_is_generic_only():
     assert _roundtrip(spec) == spec
     assert spec.failure_policy.max_schema_repairs == 1
     public = {n for n in vars(agents_contracts) if not n.startswith("_")}
+    # M2 adds the generic envelope here; per-agent payload models live in contracts/agent_io.py.
     for forbidden in ("DiscoveryInput", "DiscoveryOutput", "ExtractionInput", "ExtractionOutput",
-                      "RelationshipInput", "RelationshipOutput", "AgentRequest", "AgentResponse"):
+                      "RelationshipInput", "RelationshipOutput"):
         assert forbidden not in public
+    assert {"AgentRequest", "AgentResponse", "Meta", "CallLimits", "Usage", "AgentError"} <= public
     assert {m.value for m in agents_contracts.AgentName} == {
         "supervisor_advisor", "discovery", "extraction", "relationship_verification",
         "website_resolution", "deduplication", "validation"}

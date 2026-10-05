@@ -88,6 +88,14 @@ class Settings(BaseSettings):
     max_tool_calls_per_task: int = Field(default=20, ge=1)
     max_tool_calls_per_run: int = Field(default=5000, ge=1)
 
+    # M2 agent infrastructure (ARCHITECTURE 25.2, 25.4, 27.3)
+    max_provider_requests_per_invocation: int = Field(default=6, ge=1)
+    llm_breaker_threshold: int = Field(default=5, ge=1)
+    llm_transport_retries: int = Field(default=3, ge=0)
+    llm_backoff_base_seconds: float = Field(default=1.0, ge=0)
+    llm_backoff_max_seconds: float = Field(default=30.0, ge=0)
+    llm_temperature: float = Field(default=0.0, ge=0, le=2)
+    llm_cassette_dir: Path = Path("./.cache/llm_cassettes")
     # Providers (blank until a later milestone). Keys are never logged.
     llm_provider: str = ""
     llm_model: str = ""
