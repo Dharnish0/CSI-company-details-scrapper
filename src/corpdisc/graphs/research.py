@@ -60,6 +60,7 @@ from corpdisc.gates import (
     check_g14_website_requirement,
 )
 from corpdisc.graphs.deps import ResearchDeps
+from corpdisc.graphs.grounding import ground_entities
 from corpdisc.logging_setup import get_logger
 from corpdisc.models.domain import (
     CandidateKind,
@@ -483,24 +484,10 @@ class ResearchGraph:
         return {"route": "extraction_agent" if sc.chunks else "mark_terminal"}
 
     def _ground(self, out: ExtractionOutput, ch: dict[str, Any]) -> tuple[list[tuple[Any, str]], list[Any]]:
-        """Return (failures [(entity, gate)], passing entities) for G1/G2/G3 on one chunk output."""
-        fails, ok = [], []
-        dom_names = " ".join(c.name_text for c in ch["dom"])
-        dom_ids = {c.raw_candidate_id for c in ch["dom"]}
-        for e in out.entities:
-            if not e.is_corporate_entity or e.kind in NON_ENTITY_KINDS:
-                ok.append(e)
-                continue
-            if e.claim.page_id != ch["page_id"] or (e.link_id is not None and e.link_id not in ch["link_ids"]) or (
-                    e.raw_candidate_id is not None and e.raw_candidate_id not in dom_ids):
-                fails.append((e, "G1"))
-            elif not check_g2_name_grounding(e.name, ch["page_text"], dom_names or None).allowed:
-                fails.append((e, "G2"))
-            elif not check_g3_quote_grounding(e.claim.quote, ch["page_text"], self.d.verifier).allowed:
-                fails.append((e, "G3"))
-            else:
-                ok.append(e)
-        return fails, ok
+        """G1/G2/G3 for one chunk output (shared pure implementation in graphs.grounding)."""
+        rep = ground_entities(out, page_id=ch["page_id"], page_text=ch["page_text"], dom_candidates=ch["dom"],
+                              link_ids=ch["link_ids"], verifier=self.d.verifier)
+        return list(rep.failed), [*rep.accepted, *rep.non_entities]
 
     def n_extraction_agent(self, s: ResearchState) -> dict[str, Any]:
         sc, t = self.sc(s), s.task
@@ -975,14 +962,17 @@ class ResearchGraph:
             d.committer.commit(CommitPlan(run_id=t.run_id, task_id=t.task_id, entity_updates=tuple(updates)))
         return {"enqueued_task_ids": enq, "route": "finish"}
 
+    def _flush(self, s: ResearchState) -> None:
+        """Persist audit rows (gate rejections, candidate decisions, review items) on terminal paths too."""
+        if s.rejections or s.cand_rows or s.reviews or s.partial:
+            self.n_commit(s)
+
     def n_mark_terminal(self, s: ResearchState) -> dict[str, Any]:
+        self._flush(s)
         return {"outcome": s.outcome or "TERMINAL", "route": "finish"}
 
     def n_mark_unreachable(self, s: ResearchState) -> dict[str, Any]:
-        t = s.task
-        if s.rejections:
-            self.d.committer.commit(CommitPlan(run_id=t.run_id, task_id=t.task_id,
-                                               gate_rejections=tuple(GateRejectionWrite(**r) for r in s.rejections)))
+        self._flush(s)
         return {"outcome": "UNREACHABLE", "route": "finish"}
 
     def n_finish(self, s: ResearchState) -> dict[str, Any]:
