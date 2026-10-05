@@ -204,9 +204,10 @@ class Scratch:
     chunks: dict[str, dict[str, Any]] = None  # type: ignore[assignment]
     extractions: list[tuple[str, ExtractionOutput]] = None  # type: ignore[assignment]
     parent_regs: set[str] = None  # type: ignore[assignment]
+    hits: dict[str, dict[int, str]] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
-        self.page_indexes, self.chunks, self.extractions, self.parent_regs = {}, {}, [], set()
+        self.page_indexes, self.chunks, self.extractions, self.parent_regs, self.hits = {}, {}, [], set(), {}
 
 
 def _rej(gate: str, ref: str, detail: str, inv: int | None = None) -> dict[str, Any]:
@@ -407,8 +408,11 @@ class ResearchGraph:
                 rej.append(_rej("G1", ref, g.detail or ""))
                 continue
             lk = idx.get(p["link_id"])
+            hint = lk.page_type_hint.value if lk.page_type_hint else None
             checks = [
                 ("G4", check_g4_scope(p["page_type"], lk.url)),
+                # an agent's page_type label can never launder an excluded page: also check the deterministic hint/URL
+                ("G4", check_g4_scope(hint, lk.url)),
                 ("G5", check_g5_platform_blocklist(lk.url, frozenset(d.settings.shared_platform_domains))),
                 ("G8", check_g8_url_canonical(lk.url, sc.base_url, seen, s.task.entity_id)),
             ]
@@ -653,23 +657,33 @@ class ResearchGraph:
         for c in [c for c in s.cands if not c.dropped and not c.site_url][:10]:
             idx = sc.page_indexes.get(c.page_id)
             refs = idx.to_refs(None, limit=30) if idx else []
-            payload = WebsiteInput(entity=self.card(None, c.name, c.proposed_type), parent=parent, source_links=refs)
+            hits = d.search.hits_for(c.name, t.entity_name, country=c.country) if d.search else []
+            sc.hits[c.ref] = {h.hit_id: h.url for h in hits}
+            payload = WebsiteInput(entity=self.card(None, c.name, c.proposed_type), parent=parent, source_links=refs,
+                                   search_hits=hits)
             resp, extra = self.call(s, "website", payload, f"website:{c.ref}")
             errors += extra.get("errors", [])
             if resp.status is not CallStatus.OK or resp.payload is None:
                 continue  # fallback: only links found on the source page are used (25.5) -> no website
             o = resp.payload
-            if o.decision != "SELECTED" or o.selected_link_id is None or o.agent_confidence < 0.70:
+            if o.decision != "SELECTED" or o.agent_confidence < d.settings.website_min_conf:
                 continue
-            if not check_g1_id_integrity(str(o.selected_link_id), idx.ids if idx else frozenset()).allowed:
-                rej.append(_rej("G1", f"link_id={o.selected_link_id}", "website link id not supplied"))
+            if o.selected_hit_id is not None:
+                known = sc.hits.get(c.ref, {})
+                if not check_g1_id_integrity(str(o.selected_hit_id), frozenset(known)).allowed:
+                    rej.append(_rej("G1", f"hit_id={o.selected_hit_id}", "website hit id not supplied"))
+                    continue
+                url, method = known[o.selected_hit_id], "SEARCH_AGENT"
+            else:
+                if not check_g1_id_integrity(str(o.selected_link_id), idx.ids if idx else frozenset()).allowed:
+                    rej.append(_rej("G1", f"link_id={o.selected_link_id}", "website link id not supplied"))
+                    continue
+                url, method = idx.get(o.selected_link_id).url, "LINKED_ON_PARENT"
+            if not check_g5_platform_blocklist(url, frozenset(d.settings.shared_platform_domains)).allowed:
+                rej.append(_rej("G5", url, "blocklisted website"))
                 continue
-            lk = idx.get(o.selected_link_id)
-            if not check_g5_platform_blocklist(lk.url, frozenset(d.settings.shared_platform_domains)).allowed:
-                rej.append(_rej("G5", lk.url, "blocklisted website"))
-                continue
-            reg = registrable_domain(lk.url)
-            c.site_url, c.site_method = lk.url, "LINKED_ON_PARENT"
+            reg = registrable_domain(url)
+            c.site_url, c.site_method = url, method
             c.site_kind = (WebsiteKind.SECTION_OF_PARENT if reg == registrable_domain(sc.base_url)
                            else WebsiteKind.OFFICIAL).value
         return {"cands": s.cands, "errors": errors, "rejections": rej, "route": "gate_website"}
@@ -952,11 +966,12 @@ class ResearchGraph:
             eligible = c.status == "CONFIRMED" or (c.status == "REVIEW_REQUIRED" and st.recurse_into_review and row["url"])
             if not eligible or row["crawl_state"] != CrawlState.PENDING.value or not row["url"]:
                 continue
-            if row["kind"] != WebsiteKind.OFFICIAL.value:
-                continue  # shared/section sites are not crawled by default (25.5)
             etype = EntityType(row["entity_type"])
-            if etype not in CRAWLABLE_TYPES:
-                verdict = d.advisor.advise(d, eid, t.depth + 1, f"TYPE_{etype.name}") if d.advisor else None
+            shared = row["kind"] != WebsiteKind.OFFICIAL.value
+            if shared or etype not in CRAWLABLE_TYPES:  # grey zone (29.7): the Advisor may say CRAWL, default is TERMINAL
+                reason = "SHARED_DOMAIN" if shared else {"Brand": "TYPE_BRAND", "Division": "TYPE_DIVISION",
+                                                         "Business Unit": "TYPE_DIVISION"}.get(etype.value, "TYPE_UNKNOWN")
+                verdict = d.advisor.advise(d, eid, t.depth + 1, reason) if d.advisor else None
                 if verdict != "CRAWL":
                     updates.append(EntityUpdate(entity_id=eid, crawl_state=CrawlState.TERMINAL))
                     continue

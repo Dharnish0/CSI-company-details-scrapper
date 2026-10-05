@@ -96,6 +96,13 @@ class Settings(BaseSettings):
     llm_backoff_max_seconds: float = Field(default=30.0, ge=0)
     llm_temperature: float = Field(default=0.0, ge=0, le=2)
     llm_cassette_dir: Path = Path("./.cache/llm_cassettes")
+    # M7 supporting agents (ARCHITECTURE 20.3)
+    advisor_enabled: bool = True
+    advisor_min_conf: float = Field(default=0.60, ge=0, le=1)
+    dedup_merge_conf: float = Field(default=0.85, ge=0, le=1)
+    dedup_different_conf: float = Field(default=0.70, ge=0, le=1)
+    validation_min_conf: float = Field(default=0.50, ge=0, le=1)
+    website_min_conf: float = Field(default=0.70, ge=0, le=1)
     # Providers (blank until a later milestone). Keys are never logged.
     llm_provider: str = ""
     llm_model: str = ""

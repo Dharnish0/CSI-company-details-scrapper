@@ -160,6 +160,23 @@ class GateRejectionWrite(Strict):
     invocation_id: int | None = Field(default=None, ge=1)
 
 
+class MergeWrite(Strict):
+    """Merge ``drop_id`` into ``keep_id`` (re-points relationships, evidence, aliases, websites)."""
+
+    keep_id: int = Field(ge=1)
+    drop_id: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=300)
+
+
+class DemotionWrite(Strict):
+    """Demote a CONFIRMED entity (and its incoming confirmed edges) to REVIEW_REQUIRED. Never promotes."""
+
+    entity_id: int = Field(ge=1)
+    reason_code: ReviewReason
+    reason_text: str = Field(min_length=1, max_length=500)
+    recommended_action: str = Field(min_length=1, max_length=500)
+
+
 class FindingWrite(Strict):
     """A validation_findings row (written only through the Committer)."""
 
@@ -187,6 +204,8 @@ class CommitPlan(Strict):
     enqueue: tuple[TaskWrite, ...] = ()
     gate_rejections: tuple[GateRejectionWrite, ...] = ()
     findings: tuple[FindingWrite, ...] = ()
+    merges: tuple[MergeWrite, ...] = ()
+    demotions: tuple[DemotionWrite, ...] = ()
 
     @model_validator(mode="after")
     def _refs_resolve(self) -> CommitPlan:

@@ -39,3 +39,24 @@ WEBSITE_V1 = COMMON + (
     "by link_id or hit_id. Prefer links on the parent's own pages. Return NONE_FOUND if no supplied option is "
     "clearly the entity's own site; AMBIGUOUS if several fit."
 )
+
+ADVISOR_V1 = COMMON + (
+    "\nTask: a newly found entity is in a grey zone (brand, division, unknown type, shared domain, or low relationship "
+    "confidence). Decide ONLY whether its own website warrants a research task: CRAWL if it likely has its own "
+    "organisational pages listing further companies, TERMINAL if it is a leaf. You are advisory; code applies "
+    "budgets, depth and cycle limits regardless of your answer."
+)
+
+DEDUP_V1 = COMMON + (
+    "\nTask: for each supplied pair of entity cards, judge whether they are the SAME organisation. Cite only signals "
+    "that were supplied (matched_signals and conflicting_signals must be subsets of the supplied signal names). "
+    "A shared name alone is not enough when parents, countries or domains conflict. Use UNSURE when the signals do "
+    "not decide it. Never invent facts about either entity."
+)
+
+VALIDATION_V1 = COMMON + (
+    "\nTask: for each suspect case flagged by deterministic checks, decide KEEP, DEMOTE or NEEDS_HUMAN. DEMOTE a "
+    "likely product/service classified as a company, an implausible type chain or a weak path. You can only lower "
+    "an entity's status, never raise it, and you never override a deterministic ERROR finding. Write a short "
+    "recommended manual action."
+)

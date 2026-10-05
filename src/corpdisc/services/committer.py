@@ -304,6 +304,23 @@ class Committer:
                 "VALUES (?,?,?,?,?,?)", (self._run_id, g.invocation_id, g.gate_code, g.item_ref, g.detail, now))
             rej_ids.append(int(cur.lastrowid))
 
+        for m in plan.merges:
+            touched |= self._merge(m.keep_id, m.drop_id, now)
+        for dm in plan.demotions:
+            row = c.execute("SELECT verification_status FROM entities WHERE entity_id=? AND run_id=?",
+                            (dm.entity_id, self._run_id)).fetchone()
+            if row is None:
+                raise _Abort([_v("INV_PLAN", f"cannot demote unknown entity {dm.entity_id}")])
+            if row[0] == VerificationStatus.REVIEW_REQUIRED.value:
+                continue  # already at or below the target; demotion never promotes
+            c.execute("UPDATE entities SET verification_status='REVIEW_REQUIRED' WHERE entity_id=?", (dm.entity_id,))
+            c.execute("UPDATE relationships SET verification_status='REVIEW_REQUIRED' "
+                      "WHERE child_id=? AND verification_status='CONFIRMED'", (dm.entity_id,))
+            c.execute("INSERT INTO review_items (run_id, entity_id, reason_code, reason_text, recommended_action, "
+                      "created_at) VALUES (?,?,?,?,?,?)", (self._run_id, dm.entity_id, dm.reason_code.value,
+                                                           dm.reason_text, dm.recommended_action, now))
+            touched.add(dm.entity_id)
+
         for f in plan.findings:
             c.execute("INSERT INTO validation_findings (run_id, check_name, severity, entity_id, relationship_id, "
                       "details, action_taken, created_at) VALUES (?,?,?,?,?,?,?,?)",
@@ -314,6 +331,64 @@ class Committer:
                               candidate_ids=tuple(cand_ids), review_ids=tuple(review_ids), task_ids=tuple(task_ids),
                               rejection_ids=tuple(rej_ids))
         return result, touched
+
+    def _merge(self, keep: int, drop: int, now: str) -> set[int]:
+        """Merge executor: re-point everything from ``drop`` to ``keep`` and mark ``drop`` merged (24.4 apply_merges)."""
+        c = self._conn
+        rows = {r["entity_id"]: r for r in c.execute(
+            "SELECT * FROM entities WHERE run_id=? AND entity_id IN (?,?)", (self._run_id, keep, drop))}
+        if keep == drop or keep not in rows or drop not in rows:
+            raise _Abort([_v("INV_PLAN", f"invalid merge {drop}->{keep}")])
+        if rows[drop]["merged_into_id"] is not None or rows[keep]["merged_into_id"] is not None:
+            raise _Abort([_v("INV5", f"entity {drop} or {keep} is already merged")])
+        touched = {keep, drop}
+        c.execute("INSERT INTO entity_aliases (entity_id, alias, normalized_alias) VALUES (?,?,?) "
+                  "ON CONFLICT(entity_id, normalized_alias) DO NOTHING",
+                  (keep, rows[drop]["name"], rows[drop]["normalized_name"]))
+        c.execute("UPDATE OR IGNORE entity_aliases SET entity_id=? WHERE entity_id=?", (keep, drop))
+        c.execute("DELETE FROM entity_aliases WHERE entity_id=?", (drop,))
+        c.execute("UPDATE OR IGNORE websites SET entity_id=? WHERE entity_id=?", (keep, drop))
+        if rows[keep]["primary_website_id"] is None and rows[drop]["primary_website_id"] is not None:
+            moved = c.execute("SELECT website_id FROM websites WHERE website_id=? AND entity_id=?",
+                              (rows[drop]["primary_website_id"], keep)).fetchone()
+            if moved:
+                c.execute("UPDATE entities SET primary_website_id=? WHERE entity_id=?", (moved[0], keep))
+        c.execute("UPDATE entities SET primary_website_id=NULL WHERE entity_id=?", (drop,))
+        keep_has_primary = c.execute("SELECT 1 FROM relationships WHERE child_id=? AND is_primary=1 AND "
+                                     "verification_status='CONFIRMED'", (keep,)).fetchone() is not None
+        for r in c.execute("SELECT * FROM relationships WHERE child_id=? OR parent_id=?", (drop, drop)).fetchall():
+            as_child = r["child_id"] == drop
+            new_parent, new_child = (r["parent_id"], keep) if as_child else (keep, r["child_id"])
+            if new_parent == new_child:  # the two entities were related to each other: the edge disappears
+                c.execute("UPDATE evidence SET relationship_id=NULL WHERE relationship_id=?", (r["relationship_id"],))
+                c.execute("DELETE FROM relationships WHERE relationship_id=?", (r["relationship_id"],))
+                continue
+            twin = c.execute("SELECT relationship_id FROM relationships WHERE parent_id=? AND child_id=?",
+                             (new_parent, new_child)).fetchone()
+            if twin:  # same pair already exists: keep the existing edge, move the evidence
+                c.execute("UPDATE evidence SET relationship_id=? WHERE relationship_id=?",
+                          (twin[0], r["relationship_id"]))
+                c.execute("DELETE FROM relationships WHERE relationship_id=?", (r["relationship_id"],))
+                continue
+            status, primary = r["verification_status"], r["is_primary"]
+            if as_child and status == "CONFIRMED" and primary and keep_has_primary:
+                status, primary = "REVIEW_REQUIRED", 0  # two confirmed primary parents: demote the newcomer
+                c.execute("INSERT INTO review_items (run_id, entity_id, possible_parent_id, reason_code, reason_text, "
+                          "recommended_action, created_at) VALUES (?,?,?,?,?,?,?)",
+                          (self._run_id, keep, r["parent_id"], "MULTI_PARENT",
+                           "merged entities had different confirmed parents", "Decide which parent owns this entity.", now))
+            c.execute("UPDATE relationships SET parent_id=?, child_id=?, verification_status=?, is_primary=? "
+                      "WHERE relationship_id=?", (new_parent, new_child, status, primary, r["relationship_id"]))
+            touched.update((new_parent, new_child))
+        c.execute("UPDATE evidence SET entity_id=? WHERE entity_id=?", (keep, drop))
+        c.execute("UPDATE candidates SET resolved_entity_id=? WHERE resolved_entity_id=?", (keep, drop))
+        c.execute("UPDATE candidates SET parent_entity_id=? WHERE parent_entity_id=?", (keep, drop))
+        c.execute("UPDATE review_items SET entity_id=? WHERE entity_id=?", (keep, drop))
+        c.execute("UPDATE review_items SET possible_parent_id=? WHERE possible_parent_id=?", (keep, drop))
+        # the absorbed entity is never exported: REJECTED + merged_into_id keeps it as a record only
+        c.execute("UPDATE entities SET merged_into_id=?, crawl_state='SKIPPED', verification_status='REJECTED', "
+                  "primary_website_id=NULL WHERE entity_id=?", (keep, drop))
+        return touched
 
     # ------------------------------------------------------------------ invariants
     def check_invariants(self, entity_ids: Collection[int] | None = None) -> list[InvariantViolation]:
@@ -366,7 +441,7 @@ class Committer:
             out.append(_v("INV3", f"entity {e} is its own ancestor through confirmed edges", e))
 
         for e in c.execute(f"SELECT entity_id, entity_type, confidence, primary_website_id FROM entities "  # noqa: S608
-                           f"WHERE verification_status = ? AND entity_id IN ({marks})", (_CONFIRMED, *ids)):
+                           f"WHERE verification_status = ? AND merged_into_id IS NULL AND entity_id IN ({marks})", (_CONFIRMED, *ids)):
             eid = e["entity_id"]
             if e["entity_type"] == EntityType.UNKNOWN.value:
                 out.append(_v("INV5", f"confirmed entity {eid} has entity_type Unknown", eid))

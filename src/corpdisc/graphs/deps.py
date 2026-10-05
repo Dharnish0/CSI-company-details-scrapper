@@ -18,6 +18,7 @@ from corpdisc.services.fetch import FetchService
 from corpdisc.services.matcher import Matcher
 from corpdisc.services.queue import QueueService
 from corpdisc.services.quotes import QuoteVerifier
+from corpdisc.services.search import SearchService
 
 
 class AdvisorPort(Protocol):
@@ -50,5 +51,6 @@ class ResearchDeps:
     runner: AgentRunner
     agents: dict[str, Any]  # discovery, extraction, relationship, website (BaseAgent instances)
     advisor: AdvisorPort | None = None
+    search: SearchService | None = None
     dedup: DedupPort | None = None
     scratch: dict[int, Any] = field(default_factory=dict)  # per-task bulky data, never in graph state

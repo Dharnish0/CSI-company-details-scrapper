@@ -124,17 +124,42 @@ class Brain:
     def __init__(self) -> None:
         self.mutators: list[Callable[[str, dict], dict]] = []
         self.calls: list[str] = []
+        # M7 agents (opt-in via build_world(extra_agents=...)); tests override these
+        self.advisor_decision, self.advisor_conf = "TERMINAL", 0.9
+        self.dedup_verdict: Callable[[dict], tuple] = lambda pair: ("UNSURE", 0.5, [], [])
+        self.validation_verdict: Callable[[dict], tuple] = lambda case: ("KEEP", 0.9, None)
 
     def __call__(self, request) -> str:  # ProviderRequest -> JSON text
         text = request.messages[0].content
         payload, _ = json.JSONDecoder().raw_decode(text)
         self.calls.append(request.schema_name)
         fn = {"ExtractionOutput": self.extract, "DiscoveryOutput": self.discover,
-              "RelationshipOutput": self.relationship, "WebsiteOutput": self.website}[request.schema_name]
+              "RelationshipOutput": self.relationship, "WebsiteOutput": self.website,
+              "RecursionOutput": self.advise, "DuplicateOutput": self.dedup, "ValidationOutput": self.validate,
+              }[request.schema_name]
         out = fn(payload)
         for m in self.mutators:
             out = m(request.schema_name, out)
         return json.dumps(out)
+
+    def advise(self, p: dict) -> dict:
+        return {"decision": self.advisor_decision, "agent_confidence": self.advisor_conf, "reason": "fixture policy"}
+
+    def dedup(self, p: dict) -> dict:
+        out = []
+        for pair in p["pairs"]:
+            verdict, conf, matched, conflicting = self.dedup_verdict(pair)
+            out.append({"pair_id": pair["pair_id"], "verdict": verdict, "matched_signals": matched,
+                        "conflicting_signals": conflicting, "agent_confidence": conf, "reason": "fixture"})
+        return {"verdicts": out}
+
+    def validate(self, p: dict) -> dict:
+        out = []
+        for case in p["cases"]:
+            verdict, conf, code = self.validation_verdict(case)
+            out.append({"case_id": case["case_id"], "verdict": verdict, "reason_code": code, "agent_confidence": conf,
+                        "reason": "fixture", "recommended_manual_action": "Review the entity manually."})
+        return {"judgements": out}
 
     @staticmethod
     def extract(p: dict) -> dict:

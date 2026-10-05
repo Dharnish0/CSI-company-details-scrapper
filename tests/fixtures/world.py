@@ -4,7 +4,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from corpdisc.agents.advisor import AdvisorAgent
 from corpdisc.agents.broker import ToolBroker
+from corpdisc.agents.dedup import DedupAgent
+from corpdisc.agents.validation import ValidationAgent
 from corpdisc.agents.discovery import DiscoveryAgent
 from corpdisc.agents.extraction import ExtractionAgent
 from corpdisc.agents.gateway import CircuitBreaker, GatewayPolicy, LLMGateway
@@ -17,6 +20,7 @@ from corpdisc.db.repos.audit import SqliteAuditSink, SqliteResponseCache
 from corpdisc.db.repos.pages import PageRepo
 from corpdisc.db.repos.runs import RunRepo
 from corpdisc.graphs.deps import ResearchDeps
+from corpdisc.graphs.support import AdvisorService, DedupService
 from corpdisc.graphs.tools import make_page_excerpt_spec
 from corpdisc.graphs.supervisor import Supervisor, init_run
 from corpdisc.services.budget import BudgetGuard, BudgetLimits
@@ -66,7 +70,7 @@ class World:
 
 
 def build_world(tmp_path: Path, *, conn=None, http=None, brain=None, settings_kw=None, breaker_threshold=5,
-                llm_token_budget=None, run_id=None, token_budget=None, cache_dir=None) -> World:
+                llm_token_budget=None, run_id=None, token_budget=None, cache_dir=None, extra_agents=(), search=None) -> World:
     conn = conn or make_db(tmp_path)
     kw = dict(start_url="https://root.test/", root_company=ROOT, root_code="NWH", request_delay_seconds=0.0,
               max_retries=0, db_path=tmp_path / "x.db", cache_dir=cache_dir or tmp_path / ".cache",
@@ -105,7 +109,10 @@ def build_world(tmp_path: Path, *, conn=None, http=None, brain=None, settings_kw
         matcher=Matcher.from_settings(conn, run_id, settings), committer=committer,
         calc=ConfidenceCalculator.from_settings(settings), verifier=verifier, runner=runner,
         agents={"discovery": DiscoveryAgent(), "extraction": ExtractionAgent(), "relationship": RelationshipAgent(),
-                "website": WebsiteAgent()})
+                "website": WebsiteAgent(),
+                **{k: {"advisor": AdvisorAgent, "dedup": DedupAgent, "validation": ValidationAgent}[k]() for k in extra_agents}},
+        advisor=AdvisorService() if "advisor" in extra_agents else None,
+        dedup=DedupService() if "dedup" in extra_agents else None, search=search)
     sup = Supervisor(deps, runs)
     return World(conn, deps, sup, http, brain, provider, clock, run_id)
 
