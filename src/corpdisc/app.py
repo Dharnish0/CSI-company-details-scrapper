@@ -55,7 +55,7 @@ from corpdisc.services.robots import PageRepoRobotsStore, RobotsService
 from corpdisc.services.search import SearchService
 from corpdisc.transport import JsonTransport
 
-REAL_PROVIDERS = frozenset({"anthropic", "openai"})
+REAL_PROVIDERS = frozenset({"anthropic", "openai", "ollama"})
 
 
 @dataclass

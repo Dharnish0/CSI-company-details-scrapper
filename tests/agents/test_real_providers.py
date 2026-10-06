@@ -162,10 +162,11 @@ def test_network_failures_map_to_provider_errors(make):
 
 
 def test_adapters_need_a_key_and_hide_it_in_repr():
+    # Anthropic requires an API key
     with pytest.raises(ValueError):
         AnthropicProvider(api_key="", transport=FakeTransport())
-    with pytest.raises(ValueError):
-        OpenAICompatProvider(api_key="", transport=FakeTransport())
+    # OpenAI-compatible providers (including Ollama) can work without a key
+    OpenAICompatProvider(api_key="", transport=FakeTransport())
     assert KEY not in repr(anth(anthropic_ok())[0]) and KEY not in repr(oai(openai_ok())[0])
 
 

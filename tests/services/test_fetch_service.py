@@ -252,6 +252,20 @@ def test_too_many_redirects_and_loops(make_env):
     assert e.fetch("/nol").error_code == "REDIRECT_ERROR"
 
 
+def test_trailing_slash_redirect_does_not_trigger_loop_error(make_env):
+    # Regression test: redirect from URL without trailing slash to URL with trailing slash
+    # The redirect target is resolved to "https://a.test/page/" (with trailing slash)
+    # and canonicalized to "https://a.test/page" (without trailing slash)
+    # The key fix: we follow the redirect to the RESOLVED URL, not the canonicalized URL
+    e = make_env({f"{U}/page": resp(f"{U}/page", 301, "", headers={"Location": "/page/"}),
+                  f"{U}/page/": resp(f"{U}/page/", 200, BODY)})
+    r = e.fetch("/page")
+    assert r.ok and r.crawl_status is CrawlStatus.OK
+    assert r.final_url == f"{U}/page/"
+    # The redirect chain stores canonical URLs; both visit canonicalize to the same value
+    assert r.redirect_chain == [f"{U}/page", f"{U}/page"]
+
+
 def test_private_host_is_blocked_unless_allowed(make_env):
     e = make_env({})
     r = e.svc.fetch("http://127.0.0.1:9/x", run_id=e.run_id)

@@ -18,8 +18,7 @@ class OpenAICompatProvider:
 
     def __init__(self, *, api_key: str, transport: JsonTransport, base_url: str = "", timeout: float = 60.0,
                  price_in_per_mtok: float = 0.0, price_out_per_mtok: float = 0.0) -> None:
-        if not api_key:
-            raise ValueError("an API key is required")
+        # API key is optional for OpenAI-compatible providers (e.g., local Ollama)
         self._key = api_key
         self._t = transport
         self._url = (base_url.rstrip("/") or "https://api.openai.com") + "/v1/chat/completions"
@@ -27,7 +26,7 @@ class OpenAICompatProvider:
         self._pin, self._pout = price_in_per_mtok, price_out_per_mtok
 
     def __repr__(self) -> str:
-        return "OpenAICompatProvider(key=***)"
+        return "OpenAICompatProvider(key=***)" if self._key else "OpenAICompatProvider(key=none)"
 
     def complete(self, request: ProviderRequest) -> ProviderResponse:
         msgs = [{"role": "system", "content": request.system}, *merge_messages(request.messages)]
@@ -40,7 +39,9 @@ class OpenAICompatProvider:
         if request.tools:
             body["tools"] = [{"type": "function", "function": {"name": t.name, "description": t.description,
                                                                "parameters": t.args_schema}} for t in request.tools]
-        headers = {"authorization": f"Bearer {self._key}", "content-type": "application/json"}
+        headers = {"content-type": "application/json"}
+        if self._key:
+            headers["authorization"] = f"Bearer {self._key}"
         try:
             reply = self._t.post(self._url, headers=headers, body=json.dumps(body), timeout=self._timeout)
         except TransportFailure as exc:

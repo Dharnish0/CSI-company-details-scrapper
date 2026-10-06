@@ -12,7 +12,7 @@ from corpdisc.transport import JsonTransport
 from corpdisc.agents.providers.cassette import RecordingProvider, ReplayProvider
 from corpdisc.agents.providers.fake import FakeLLMProvider
 
-REAL_PROVIDERS = frozenset({"openai", "anthropic"})
+REAL_PROVIDERS = frozenset({"openai", "anthropic", "ollama"})
 UNIMPLEMENTED_PROVIDERS = frozenset({"gemini", "google"})
 
 
@@ -56,11 +56,13 @@ def build_provider_from_settings(settings: Settings, *, transport: JsonTransport
         return ReplayProvider(settings.llm_cassette_dir / "default.jsonl")
     inner: LLMProvider
     if name in REAL_PROVIDERS:
-        if settings.llm_api_key is None:
+        if settings.llm_api_key is None and name != "ollama":
             raise ValueError(f"LLM_API_KEY is required for provider '{name}'")
         if transport is None:
             raise ValueError("a transport is required for a real provider")
-        kw = dict(api_key=settings.llm_api_key.get_secret_value(), transport=transport, base_url=settings.llm_base_url,
+        # Ollama uses localhost:11434 by default; other providers use their default base_url
+        base_url = "http://localhost:11434" if name == "ollama" else (settings.llm_base_url or "")
+        kw = dict(api_key=settings.llm_api_key.get_secret_value() if settings.llm_api_key else "", transport=transport, base_url=base_url,
                   timeout=settings.llm_timeout_seconds, price_in_per_mtok=settings.llm_price_in_per_mtok,
                   price_out_per_mtok=settings.llm_price_out_per_mtok)
         inner = AnthropicProvider(**kw) if name == "anthropic" else OpenAICompatProvider(**kw)

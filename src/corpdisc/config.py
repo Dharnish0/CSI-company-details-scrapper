@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     llm_temperature: float = Field(default=0.0, ge=0, le=2)
     llm_cassette_dir: Path = Path("./.cache/llm_cassettes")
     # M8 real providers
-    llm_timeout_seconds: float = Field(default=60.0, gt=0)
+    llm_timeout_seconds: float = Field(default=300.0, gt=0)
     llm_base_url: str = ""
     llm_price_in_per_mtok: float = Field(default=0.0, ge=0)
     llm_price_out_per_mtok: float = Field(default=0.0, ge=0)

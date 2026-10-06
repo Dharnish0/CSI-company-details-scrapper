@@ -610,7 +610,17 @@ class FetchService:
                     return self._fail(ctx, CrawlStatus.HTTP_ERROR, "TOO_MANY_REDIRECTS", f"more than {cfg.max_redirects} redirects",
                                       http_status=code, final_url=current, fetch_method="requests", robots_allowed=True)
                 nxt = self._canon(location, current)
-                if not nxt.ok or nxt.canonical is None or nxt.domain is None or nxt.canonical in ctx.chain:
+                # Resolve the redirect target to an absolute URL for the HTTP request
+                # We use urljoin here to get the resolved URL (e.g., "/page/" → "https://a.test/page/")
+                from urllib.parse import urljoin
+                resolved_url = urljoin(current, location)
+                
+                # Loop detection: only flag if redirect target is a PREVIOUS hop (not the current URL after normalization)
+                if not nxt.ok or nxt.canonical is None or nxt.domain is None:
+                    return self._fail(ctx, CrawlStatus.HTTP_ERROR, "REDIRECT_ERROR", "invalid or looping redirect target",
+                                      http_status=code, final_url=current, fetch_method="requests", robots_allowed=True)
+                # Check for loop: redirect target must not be a URL we've already visited (excluding current)
+                if nxt.canonical in ctx.chain[:-1] if len(ctx.chain) > 1 else False:
                     return self._fail(ctx, CrawlStatus.HTTP_ERROR, "REDIRECT_ERROR", "invalid or looping redirect target",
                                       http_status=code, final_url=current, fetch_method="requests", robots_allowed=True)
                 if not cfg.allow_private_hosts and is_private_host(nxt.host):
@@ -622,7 +632,8 @@ class FetchService:
                     return self._fail(ctx, CrawlStatus.BLOCKED_ROBOTS, rc, f"redirect target blocked: {verdict.reason.value}",
                                       http_status=code, final_url=current, robots_allowed=False, fetch_method="requests")
                 ctx.chain.append(nxt.canonical)
-                current, domain, hops = nxt.canonical, nxt.domain, hops + 1
+                # Use the resolved URL (not canonicalized) for the HTTP request to preserve trailing slashes
+                current, domain, hops = resolved_url, nxt.domain, hops + 1
                 continue
             break
 
