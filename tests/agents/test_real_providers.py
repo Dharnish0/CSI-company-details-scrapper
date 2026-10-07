@@ -154,7 +154,8 @@ def test_malformed_and_empty_responses(make, ok_empty):
 
 @pytest.mark.parametrize("make", [anth, oai])
 def test_network_failures_map_to_provider_errors(make):
-    for code, retryable in (("TIMEOUT", True), ("CONNECTION", True), ("SSL", False), ("TOO_LARGE", False)):
+    # TIMEOUT is not retried: an identical request would consume the whole timeout again. CONNECTION (nothing processed) is.
+    for code, retryable in (("TIMEOUT", False), ("CONNECTION", True), ("SSL", False), ("TOO_LARGE", False)):
         p, _ = make(TransportFailure(code))
         with pytest.raises(ProviderTransportError) as e:
             p.complete(req())

@@ -72,5 +72,8 @@ class AnthropicProvider:
         u = data.get("usage") or {}
         tin, tout = int(u.get("input_tokens", 0) or 0), int(u.get("output_tokens", 0) or 0)
         cost = (tin * self._pin + tout * self._pout) / 1_000_000
+        sr = data.get("stop_reason")
         return ProviderResponse(content=content or None, tool_calls=tuple(calls),
+                                finish_reason="length" if sr == "max_tokens" else sr,
+                                metrics={"prompt_tokens": tin, "completion_tokens": tout},
                                 usage=ProviderUsage(tin, tout, round(cost, 6)), model=str(data.get("model") or request.model))

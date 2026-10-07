@@ -99,6 +99,12 @@ class Settings(BaseSettings):
     # M8 real providers
     llm_timeout_seconds: float = Field(default=300.0, gt=0)
     llm_base_url: str = ""
+    # Ollama (native /api/chat): explicit context window (constant so the model is not reloaded between requests) and keep-alive
+    ollama_num_ctx: int = Field(default=12288, ge=1024)
+    ollama_keep_alive: str = "30m"
+    # Reasoning control for the structured Extraction Agent: "none" = think off (structured extraction is not open-ended
+    # reasoning, and hidden thinking tokens would consume the output cap); "default" = leave the model's default.
+    llm_extraction_reasoning: Literal["none", "default"] = "none"
     llm_price_in_per_mtok: float = Field(default=0.0, ge=0)
     llm_price_out_per_mtok: float = Field(default=0.0, ge=0)
     llm_record_to: Path | None = None  # also write every successful response to this JSONL cassette

@@ -28,7 +28,7 @@ from corpdisc.contracts.agent_io import (
     RelationshipInput,
     WebsiteInput,
 )
-from corpdisc.contracts.agents import AgentRequest, AgentResponse, CallLimits, CallStatus, Meta
+from corpdisc.contracts.agents import AgentRequest, AgentResponse, CallLimits, CallStatus, FailureKind, Meta
 from corpdisc.contracts.common import PageType, SourceClass, Supports, VerifiedEvidence
 from corpdisc.contracts.postgate import (
     AliasWrite,
@@ -212,6 +212,54 @@ class Scratch:
 
 def _rej(gate: str, ref: str, detail: str, inv: int | None = None) -> dict[str, Any]:
     return {"gate_code": gate, "item_ref": str(ref)[:300], "detail": str(detail)[:500], "invocation_id": inv}
+
+
+_WS = re.compile(r"\s+")
+# Hard per-chunk budgets for the side data sent next to the (<= CHUNK_CHARS) page text. They bound the whole request so that
+# system + user + output cap fit the Ollama context window by construction, instead of depending on how listing pages look.
+SIDE_BUDGET_DOM: Final = 4000
+SIDE_BUDGET_LINKS: Final = 4500
+CONTEXT_MAX: Final = 100
+
+
+def _is_home(c, chunk_text_norm: str) -> bool:  # type: ignore[no-untyped-def]
+    ctx = _WS.sub(" ", c.context or "").strip().lower()
+    return not ctx or ctx == c.name_text.lower() or ctx in chunk_text_norm
+
+
+def _compact_candidate(c, chunk_text_norm: str):  # type: ignore[no-untyped-def]
+    """A DOM candidate's ``context`` that is already part of the chunk is pure duplication: replace it by the name. Context from
+    elsewhere on the page is kept but shortened. name_text, dom_hint and link_id (what G1/G2 and the model need) never change."""
+    ctx = _WS.sub(" ", c.context or "").strip()
+    if _is_home(c, chunk_text_norm):
+        return c.model_copy(update={"context": c.name_text}) if ctx and ctx != c.name_text else c
+    return c.model_copy(update={"context": ctx[:CONTEXT_MAX]})
+
+
+def _side_data(dom, all_links, chunk_text: str, low: str):  # type: ignore[no-untyped-def]
+    """DOM candidates and links for ONE chunk within fixed budgets: candidates whose own text is in the chunk first, links
+    referenced by the kept candidates first. Document order is restored afterwards. G1 later checks ids against exactly this set."""
+    norm = _WS.sub(" ", chunk_text).lower()
+    cands = [c for c in dom if c.name_text.lower() in low]
+    cands.sort(key=lambda c: not _is_home(c, norm))  # stable
+    kept, used = [], 0
+    for c in cands:
+        cc = _compact_candidate(c, norm)
+        size = len(cc.model_dump_json())
+        if used + size <= SIDE_BUDGET_DOM:
+            kept.append(cc)
+            used += size
+    kept.sort(key=lambda c: c.raw_candidate_id)
+    referenced = {c.link_id for c in kept if c.link_id is not None}
+    pool = sorted((lk for lk in all_links if lk.anchor_text and lk.anchor_text.lower() in low), key=lambda lk: lk.link_id not in referenced)
+    links, used = [], 0
+    for lk in pool:
+        size = len(lk.anchor_text) + len(lk.url) + 90
+        if used + size <= SIDE_BUDGET_LINKS and len(links) < 60:
+            links.append(lk)
+            used += size
+    links.sort(key=lambda lk: lk.link_id)
+    return kept, links
 
 
 def _title(html: str | None) -> str | None:
@@ -481,8 +529,7 @@ class ResearchGraph:
             truncated = len(chunks) > MAX_CHUNKS_PER_PAGE
             for i, (ctext, coff) in enumerate(chunks[:MAX_CHUNKS_PER_PAGE]):
                 low = ctext.lower()
-                cdom = [c for c in dom if c.name_text.lower() in low]
-                links = [lk for lk in idx.links if lk.anchor_text and lk.anchor_text.lower() in low][:60]
+                cdom, links = _side_data(dom, idx.links, ctext, low)
                 key = f"{pid}:{i}"
                 sc.chunks[key] = {
                     "page_id": pid, "url": row.canonical_url, "page_type": ptype, "text": ctext, "offset": coff,
@@ -517,6 +564,9 @@ class ResearchGraph:
             if resp.status is not CallStatus.OK or resp.payload is None:
                 partial = True
                 rej.append(_rej("G12", key, f"extraction failed: {resp.error.message if resp.error else ''}"))
+                if resp.error is not None and resp.error.kind in (FailureKind.TRANSPORT, FailureKind.CIRCUIT_OPEN):
+                    errors.append("extraction stopped: provider unavailable, remaining chunks not attempted")
+                    break  # bounded: do not wait out the timeout again for every remaining chunk
                 continue
             fails, _ = self._ground(resp.payload, ch)
             if fails:  # one grounding re-ask listing exactly what failed (25.2)

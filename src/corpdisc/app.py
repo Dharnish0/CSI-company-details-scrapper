@@ -23,6 +23,7 @@ from corpdisc.agents.runner import AgentRunner, RunnerLimits
 from corpdisc.agents.validation import ValidationAgent
 from corpdisc.agents.website import WebsiteAgent
 from corpdisc.clock import Clock, Sleeper, SystemClock
+from corpdisc.contracts.agents import AgentName
 from corpdisc.config import Settings
 from corpdisc.db.connection import connect_writer, init_db
 from corpdisc.db.repos.audit import SqliteAuditSink, SqliteResponseCache
@@ -140,7 +141,8 @@ def build_runtime(
     audit = SqliteAuditSink(conn)
     broker = ToolBroker([make_page_excerpt_spec(pages, cache, run_id)], audit=audit, clock=clock, budget=budget)
     runner = AgentRunner(gateway=gateway, audit=audit, cache=SqliteResponseCache(conn), budget=budget, broker=broker,
-                         limits=RunnerLimits.from_settings(settings), clock=clock)
+                         limits=RunnerLimits.from_settings(settings), clock=clock,
+                         reasoning_overrides={AgentName.EXTRACTION: "none"} if settings.llm_extraction_reasoning == "none" else None)
     committer = Committer.from_settings(conn, run_id=run_id, page_text=make_page_text_loader(pages, cache),
                                         settings=settings, clock=clock)
     deps = ResearchDeps(

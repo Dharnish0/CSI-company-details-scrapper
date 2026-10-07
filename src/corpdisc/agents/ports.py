@@ -78,6 +78,7 @@ class ProviderRequest:
     max_output_tokens: int
     tools: tuple[ToolDescriptor, ...] = ()
     metadata: Mapping[str, str] = field(default_factory=dict)
+    reasoning: str | None = None  # "none" asks a thinking model not to think; None = provider default
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,8 @@ class ProviderResponse:
     tool_calls: tuple[ToolCallRequest, ...] = ()
     usage: ProviderUsage = ProviderUsage()
     model: str = ""
+    finish_reason: str | None = None  # normalised: "stop" | "length" | "tool_calls" | provider value
+    metrics: Mapping[str, Any] = field(default_factory=dict)  # structured diagnostics, never page content or secrets
 
 
 class LLMProvider(Protocol):

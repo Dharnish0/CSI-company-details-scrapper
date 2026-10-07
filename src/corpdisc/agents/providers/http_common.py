@@ -38,8 +38,10 @@ def strip_fences(text: str) -> str:
 
 
 def failure_to_error(exc: TransportFailure) -> ProviderError:
-    # TLS failures are configuration problems: never retried and never bypassed (25.1)
-    return ProviderTransportError(f"transport {exc.code}", retryable=exc.code in ("TIMEOUT", "CONNECTION"))
+    # TLS failures are configuration problems: never retried and never bypassed (25.1). A TIMEOUT is not retried either:
+    # re-sending an identical request that already consumed the whole timeout only multiplies the wait (measured: 4 attempts
+    # x 300 s per chunk). Connection errors (nothing was processed) are still retried with backoff.
+    return ProviderTransportError(f"transport {exc.code}", retryable=exc.code == "CONNECTION")
 
 
 def classify(reply: HttpReply, *, provider: str, secret: str | None) -> ProviderError | None:

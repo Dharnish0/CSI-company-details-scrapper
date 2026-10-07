@@ -41,6 +41,8 @@ class BrainTransport:
             return HttpReply(401, {}, json.dumps({"error": {"message": "invalid x-api-key"}}))
         if self.mode == "timeout":
             raise TransportFailure("TIMEOUT")
+        if self.mode == "connection":
+            raise TransportFailure("CONNECTION")
         if self.flavor == "anthropic":
             name = json.loads(b["system"].split(JSON_ONLY, 1)[1])["title"]
             user = b["messages"][0]["content"]
@@ -114,18 +116,26 @@ def wire(tmp_path, transport, **kw):
     return s
 
 
-def test_timeouts_are_retried_with_backoff_then_the_breaker_opens(tmp_path):
+def test_timeouts_are_not_retried_and_the_breaker_opens_after_five(tmp_path):
     t = BrainTransport(Brain(), "anthropic")
     t.mode = "timeout"
     s = wire(tmp_path, t, threshold=5)
     for i in range(5):
         r = s.runner.invoke(ECHO, s.req(ECHO, text=str(i)))
         assert r.status is CallStatus.FAILED and r.error.kind is FailureKind.TRANSPORT
-    assert len(t.calls) == 5 * 4  # 1 attempt + 3 transport retries each, never more
-    assert len(s.clock.sleeps) == 5 * 3 and all(0 < x <= 30 for x in s.clock.sleeps)
+    assert len(t.calls) == 5 and s.clock.sleeps == []  # ONE attempt per invocation (was 4 x timeout), no backoff waits
     assert s.breaker.state is BreakerState.OPEN
     blocked = s.runner.invoke(ECHO, s.req(ECHO, text="late"))
-    assert blocked.error.kind is FailureKind.CIRCUIT_OPEN and len(t.calls) == 20  # no traffic once open
+    assert blocked.error.kind is FailureKind.CIRCUIT_OPEN and len(t.calls) == 5  # no traffic once open
+
+
+def test_connection_errors_are_still_retried_with_backoff(tmp_path):
+    t = BrainTransport(Brain(), "anthropic")
+    t.mode = "connection"
+    s = wire(tmp_path, t, threshold=5)
+    r = s.runner.invoke(ECHO, s.req(ECHO))
+    assert r.error.kind is FailureKind.TRANSPORT and len(t.calls) == 4  # 1 attempt + 3 retries: nothing was processed
+    assert len(s.clock.sleeps) == 3 and all(0 < x <= 30 for x in s.clock.sleeps)
 
 
 def test_provider_request_cap_bounds_one_invocation(tmp_path):

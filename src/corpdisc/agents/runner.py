@@ -59,7 +59,8 @@ def _schema_errors(exc: Exception) -> str:
 class AgentRunner:
     def __init__(self, *, gateway: LLMGateway, audit: AuditSink, cache: ResponseCache | None, budget: BudgetPort,
                  broker: ToolBroker | None, limits: RunnerLimits, clock: Clock,
-                 model_overrides: Mapping[AgentName, str] | None = None) -> None:
+                 model_overrides: Mapping[AgentName, str] | None = None,
+                 reasoning_overrides: Mapping[AgentName, str] | None = None) -> None:
         self._gw = gateway
         self._audit = audit
         self._cache = cache
@@ -68,6 +69,7 @@ class AgentRunner:
         self._limits = limits
         self._clock = clock
         self._models = dict(model_overrides or {})
+        self._reasoning = dict(reasoning_overrides or {})
 
     @property
     def gateway(self) -> LLMGateway:
@@ -188,7 +190,7 @@ class AgentRunner:
             preq = ProviderRequest(model=model, system=system, messages=tuple(messages),
                                    response_schema=agent.output_model.model_json_schema(),
                                    schema_name=agent.output_model.__name__, temperature=self._gw.policy.temperature,
-                                   max_output_tokens=max_out, tools=tools,
+                                   max_output_tokens=max_out, tools=tools, reasoning=self._reasoning.get(agent.name),
                                    metadata={"correlation_id": m.correlation_id, "agent": agent.name.value})
             res = self._gw.complete(preq, max_requests=self._limits.max_provider_requests - used)
             used += res.requests_used
@@ -204,6 +206,7 @@ class AgentRunner:
                 return self._fail(meta, CallStatus.FAILED, fk, res.failure.message if res.failure else "no response",
                                   Usage(tokens_in=t_in, tokens_out=t_out, cost_usd=cost, latency_ms=latency))
             r = res.response
+            diag = {"finish_reason": r.finish_reason, "provider_metrics": dict(r.metrics)}
             t_in, t_out, cost = t_in + r.usage.tokens_in, t_out + r.usage.tokens_out, cost + r.usage.cost_usd
             tok = (r.usage.tokens_in, r.usage.tokens_out)
             if r.tool_calls:
@@ -226,10 +229,14 @@ class AgentRunner:
                 out = agent.output_model.model_validate_json(r.content or "")
             except Exception as exc:  # noqa: BLE001
                 err = _schema_errors(exc)
+                truncated = r.finish_reason == "length"
+                if truncated:
+                    err = f"output truncated at the token cap (finish_reason=length); {err}"[:500]
                 self._finish(inv, CallStatus.FAILED, FailureKind.SCHEMA, {"error": {"kind": "SCHEMA", "message": err},
-                             "raw_excerpt": (r.content or "")[:2000], "transport": transport}, tokens=tok,
+                             "raw_excerpt": (r.content or "")[:2000], "transport": transport, **diag}, tokens=tok,
                              cost=r.usage.cost_usd, latency=res.latency_ms)
-                if repairs < self._limits.max_repair_attempts:
+                # A truncated answer is NOT repaired: the repair prompt would resend the same long input and truncate again.
+                if repairs < self._limits.max_repair_attempts and not truncated:
                     repairs += 1
                     messages.append(Message("assistant", (r.content or "")[:4000]))
                     messages.append(Message("user", "Your output did not match the required JSON schema. "
@@ -240,11 +247,14 @@ class AgentRunner:
                                   Usage(tokens_in=t_in, tokens_out=t_out, cost_usd=cost, latency_ms=latency,
                                         tool_calls=tool_calls))
             self._finish(inv, CallStatus.OK, None, {"payload": out.model_dump(mode="json"), "model": r.model,
-                         "provider": self._gw.provider_name, "transport": transport}, tokens=tok,
+                         "provider": self._gw.provider_name, "transport": transport, **diag}, tokens=tok,
                          cost=r.usage.cost_usd, latency=res.latency_ms)
+            pm = r.metrics
             log.info("run=%s task=%s corr=%s agent=%s invocation=%s attempt=%s status=OK cache_hit=0 tokens_in=%s "
-                     "tokens_out=%s latency_ms=%s", m.run_id, m.task_id, m.correlation_id, agent.name, inv, attempt,
-                     t_in, t_out, latency)
+                     "tokens_out=%s latency_ms=%s finish=%s req_bytes=%s prompt_eval_ms=%s eval_ms=%s load_ms=%s reasoning_chars=%s "
+                     "ctx_used_pct=%s", m.run_id, m.task_id, m.correlation_id, agent.name, inv, attempt, t_in, t_out, latency,
+                     r.finish_reason, pm.get("request_bytes"), pm.get("prompt_eval_ms"), pm.get("eval_ms"), pm.get("load_ms"),
+                     pm.get("reasoning_chars"), pm.get("context_used_pct"))
             return AgentResponse(meta=meta, status=CallStatus.OK, payload=out,
                                  usage=Usage(tokens_in=t_in, tokens_out=t_out, cost_usd=cost, latency_ms=latency,
                                              tool_calls=tool_calls))

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from corpdisc.agents.ports import LLMProvider, ProviderAuthError, ProviderNotImplementedError
 from corpdisc.agents.providers.anthropic import AnthropicProvider
+from corpdisc.agents.providers.ollama import OllamaProvider
 from corpdisc.agents.providers.openai_compat import OpenAICompatProvider
 from corpdisc.config import Settings
 from corpdisc.transport import JsonTransport
@@ -55,14 +56,17 @@ def build_provider_from_settings(settings: Settings, *, transport: JsonTransport
     if name == "replay":
         return ReplayProvider(settings.llm_cassette_dir / "default.jsonl")
     inner: LLMProvider
-    if name in REAL_PROVIDERS:
-        if settings.llm_api_key is None and name != "ollama":
+    if name == "ollama":
+        if transport is None:
+            raise ValueError("a transport is required for a real provider")
+        inner = OllamaProvider(transport=transport, base_url=settings.llm_base_url, timeout=settings.llm_timeout_seconds,
+                               num_ctx=settings.ollama_num_ctx, keep_alive=settings.ollama_keep_alive)
+    elif name in REAL_PROVIDERS:
+        if settings.llm_api_key is None:
             raise ValueError(f"LLM_API_KEY is required for provider '{name}'")
         if transport is None:
             raise ValueError("a transport is required for a real provider")
-        # Ollama uses localhost:11434 by default; other providers use their default base_url
-        base_url = "http://localhost:11434" if name == "ollama" else (settings.llm_base_url or "")
-        kw = dict(api_key=settings.llm_api_key.get_secret_value() if settings.llm_api_key else "", transport=transport, base_url=base_url,
+        kw = dict(api_key=settings.llm_api_key.get_secret_value(), transport=transport, base_url=settings.llm_base_url or "",
                   timeout=settings.llm_timeout_seconds, price_in_per_mtok=settings.llm_price_in_per_mtok,
                   price_out_per_mtok=settings.llm_price_out_per_mtok)
         inner = AnthropicProvider(**kw) if name == "anthropic" else OpenAICompatProvider(**kw)
@@ -75,5 +79,5 @@ def build_provider_from_settings(settings: Settings, *, transport: JsonTransport
     return inner
 
 
-__all__ = ["AnthropicProvider", "FakeLLMProvider", "OpenAICompatProvider", "RecordingProvider", "ReplayProvider",
+__all__ = ["OllamaProvider", "AnthropicProvider", "FakeLLMProvider", "OpenAICompatProvider", "RecordingProvider", "ReplayProvider",
            "UnconfiguredProvider", "build_provider", "build_provider_from_settings"]

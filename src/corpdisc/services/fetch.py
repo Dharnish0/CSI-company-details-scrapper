@@ -16,9 +16,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Final, Literal, Protocol
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
+from urllib3.util import parse_url as _parse_url
 from pydantic import BaseModel, ConfigDict
 
 from corpdisc.clock import Clock, Sleeper, SystemClock
@@ -104,20 +106,85 @@ def looks_like_js_shell(html: str, text: str, min_text_chars: int = 200) -> bool
 
 
 # ---------------------------------------------------------------- SSRF guard (P11)
-def is_private_host(host: str | None) -> bool:
-    """True for loopback/private/link-local/reserved IP literals and internal-only host names.
+def _numeric_ipv4(h: str) -> ipaddress.IPv4Address | None:
+    """IPv4 with ``inet_aton`` semantics: 1-4 dot-separated parts, each decimal, 0-octal or 0x-hex; the last part fills the
+    remaining bytes. These are the forms a resolver turns into an address although ``ipaddress`` rejects them."""
+    parts = h.split(".")
+    if not 1 <= len(parts) <= 4 or any(not p or not p.isascii() for p in parts):
+        return None
+    nums: list[int] = []
+    for p in parts:
+        try:
+            n = int(p, 16) if p.lower().startswith("0x") else int(p, 8) if len(p) > 1 and p.startswith("0") else int(p, 10)
+        except ValueError:
+            return None
+        nums.append(n)
+    *head, last = nums
+    if any(x > 255 for x in head) or last >= 256 ** (4 - len(head)):
+        return None
+    value = 0
+    for x in head:
+        value = (value << 8) | x
+    return ipaddress.IPv4Address((value << (8 * (4 - len(head)))) | last)
 
-    DNS resolution is not performed, so DNS rebinding is a documented limitation.
+
+def is_private_host(host: str | None) -> bool:
+    """True for loopback/private/link-local/reserved addresses (including the numeric spellings 127.1, 0x7f.0.0.1,
+    2130706433, 0177.0.0.1 and IPv4-mapped IPv6) and for internal-only host names (trailing dot ignored).
+
+    DNS resolution is not performed, so a public NAME that resolves to a private address (DNS rebinding) is a documented
+    limitation of this check.
     """
     if not host:
         return True
-    h = host.strip("[]").lower()
+    h = host.strip("[]").lower().rstrip(".")
+    if not h:
+        return True
     try:
         ip = ipaddress.ip_address(h.split("%")[0])
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
         return not ip.is_global
     except ValueError:
         pass
+    numeric = _numeric_ipv4(h)
+    if numeric is not None:
+        return not numeric.is_global
     return h == "localhost" or h.endswith((".localhost", ".local", ".internal", ".localdomain"))
+
+
+def unsafe_redirect_target(location: str) -> str | None:
+    """Why a Location header must not be followed at all (None = acceptable to parse further). Crawling never needs
+    credentials, backslashes or control characters in a redirect, and each of them is a known parser-differential trick."""
+    if any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in location):
+        return "control character or whitespace"
+    if "\\" in location:
+        return "backslash"
+    try:
+        netloc = urlsplit(location).netloc
+    except ValueError:
+        return "malformed URL"
+    if "@" in netloc:
+        return "userinfo in authority"
+    return None
+
+
+def _redirect_request_url(canonical: str, resolved: str) -> str:
+    """The URL actually requested: the VALIDATED canonical scheme/host/port/path/query, with only the trailing slash restored
+    from the resolved target (the canonicalizer drops it, which made ``/page`` -> ``/page/`` look like a loop)."""
+    c, r = urlsplit(canonical), urlsplit(resolved)
+    path = c.path or "/"
+    if r.path.endswith("/") and not path.endswith("/"):
+        path += "/"
+    return urlunsplit((c.scheme, c.netloc, path, c.query, ""))
+
+
+def _host_of(url: str) -> str | None:
+    """Host exactly as the HTTP layer (requests -> urllib3) will connect to it."""
+    try:
+        return (_parse_url(requests.Request("GET", url).prepare().url or "").host or "").lower().rstrip(".") or None
+    except Exception:  # noqa: BLE001 - anything unparsable is refused by the caller
+        return None
 
 
 # ---------------------------------------------------------------- HTTP layer
@@ -594,6 +661,7 @@ class FetchService:
     def _network(self, ctx: _Ctx, render: RenderMode | None) -> FetchResult:
         cfg = self._cfg
         current, domain, hops = ctx.canonical, ctx.domain, 0
+        seen = {current}
         while True:
             resp = self._request(ctx, current, domain)
             if resp.error_code is not None:
@@ -609,21 +677,28 @@ class FetchService:
                 if hops >= cfg.max_redirects:
                     return self._fail(ctx, CrawlStatus.HTTP_ERROR, "TOO_MANY_REDIRECTS", f"more than {cfg.max_redirects} redirects",
                                       http_status=code, final_url=current, fetch_method="requests", robots_allowed=True)
-                nxt = self._canon(location, current)
-                # Resolve the redirect target to an absolute URL for the HTTP request
-                # We use urljoin here to get the resolved URL (e.g., "/page/" → "https://a.test/page/")
-                from urllib.parse import urljoin
-                resolved_url = urljoin(current, location)
-                
-                # Loop detection: only flag if redirect target is a PREVIOUS hop (not the current URL after normalization)
+                location = location.strip()
+                why = unsafe_redirect_target(location)
+                try:
+                    resolved = urljoin(current, location) if why is None else ""
+                except ValueError:
+                    why, resolved = "malformed URL", ""
+                if why is not None:
+                    return self._fail(ctx, CrawlStatus.HTTP_ERROR, "REDIRECT_ERROR", f"unsafe redirect target ({why})",
+                                      http_status=code, final_url=current, fetch_method="requests", robots_allowed=True)
+                nxt = self._canon(resolved, current)
                 if not nxt.ok or nxt.canonical is None or nxt.domain is None:
-                    return self._fail(ctx, CrawlStatus.HTTP_ERROR, "REDIRECT_ERROR", "invalid or looping redirect target",
+                    return self._fail(ctx, CrawlStatus.HTTP_ERROR, "REDIRECT_ERROR", "invalid redirect target",
                                       http_status=code, final_url=current, fetch_method="requests", robots_allowed=True)
-                # Check for loop: redirect target must not be a URL we've already visited (excluding current)
-                if nxt.canonical in ctx.chain[:-1] if len(ctx.chain) > 1 else False:
-                    return self._fail(ctx, CrawlStatus.HTTP_ERROR, "REDIRECT_ERROR", "invalid or looping redirect target",
+                req_url = _redirect_request_url(nxt.canonical, resolved)
+                if req_url in seen:  # exact request URL already fetched in this chain: a real loop (a trailing-slash hop is not)
+                    return self._fail(ctx, CrawlStatus.HTTP_ERROR, "REDIRECT_ERROR", "redirect loop",
                                       http_status=code, final_url=current, fetch_method="requests", robots_allowed=True)
-                if not cfg.allow_private_hosts and is_private_host(nxt.host):
+                req_host = _host_of(req_url)
+                if req_host is None or req_host != (nxt.host or "").lower().rstrip("."):
+                    return self._fail(ctx, CrawlStatus.HTTP_ERROR, "REDIRECT_ERROR", "redirect host mismatch between validator and HTTP layer",
+                                      http_status=code, final_url=current, fetch_method="requests", robots_allowed=True)
+                if not cfg.allow_private_hosts and (is_private_host(nxt.host) or is_private_host(req_host)):
                     return self._fail(ctx, CrawlStatus.SKIPPED_FILTER, "PRIVATE_HOST_BLOCKED", "redirect to a private host refused",
                                       http_status=code, final_url=current, fetch_method="requests", robots_allowed=True)
                 verdict = self._robots.is_allowed(nxt.canonical)
@@ -632,8 +707,8 @@ class FetchService:
                     return self._fail(ctx, CrawlStatus.BLOCKED_ROBOTS, rc, f"redirect target blocked: {verdict.reason.value}",
                                       http_status=code, final_url=current, robots_allowed=False, fetch_method="requests")
                 ctx.chain.append(nxt.canonical)
-                # Use the resolved URL (not canonicalized) for the HTTP request to preserve trailing slashes
-                current, domain, hops = resolved_url, nxt.domain, hops + 1
+                seen.add(req_url)
+                current, domain, hops = req_url, nxt.domain, hops + 1
                 continue
             break
 

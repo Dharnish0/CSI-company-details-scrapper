@@ -66,6 +66,8 @@ class OpenAICompatProvider:
             raise ProviderTransportError("openai returned no content", retryable=True)
         u = data.get("usage") or {}
         tin, tout = int(u.get("prompt_tokens", 0) or 0), int(u.get("completion_tokens", 0) or 0)
-        return ProviderResponse(content=content, tool_calls=tuple(calls),
+        fr = (choices[0].get("finish_reason") if choices and isinstance(choices[0], dict) else None)
+        return ProviderResponse(content=content, tool_calls=tuple(calls), finish_reason=fr,
+                                metrics={"prompt_tokens": tin, "completion_tokens": tout},
                                 usage=ProviderUsage(tin, tout, round((tin * self._pin + tout * self._pout) / 1_000_000, 6)),
                                 model=str(data.get("model") or request.model))
