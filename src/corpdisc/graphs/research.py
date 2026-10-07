@@ -96,11 +96,7 @@ CRAWLABLE_TYPES: Final = frozenset({
 _OWNERSHIP_WORDING: Final = re.compile(
     r"\b(subsidiar\w*|owned|owns|acquired|division of|part of|a company of|member of|portfolio company|"
     r"operating group of|business group of|wholly)\b", re.I)
-# Wording that describes something other than ownership. A verified quote containing it can never support CONFIRMED,
-# whatever the agent says: the guard only moves toward REVIEW_REQUIRED (deterministic backstop, 20.3).
-NEGATIVE_WORDING: Final = re.compile(
-    r"\b(partners?|customers?|clients?|vendors?|suppliers?|resellers?|distributors?|competitors?|formerly|former|"
-    r"previously|sold to|divested|spun[- ]off|minority (?:stake|interest)|investor in)\b", re.I)
+from corpdisc.services.wording import NEGATIVE_WORDING  # noqa: E402  (shared with the data-quality verifier)
 Outcome = Literal["EXPANDED", "TERMINAL", "UNREACHABLE", "PARTIAL", "BUDGET_STOPPED", "SKIPPED", "NO_WEBSITE"]
 
 

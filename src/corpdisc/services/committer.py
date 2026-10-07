@@ -304,6 +304,11 @@ class Committer:
                 "VALUES (?,?,?,?,?,?)", (self._run_id, g.invocation_id, g.gate_code, g.item_ref, g.detail, now))
             rej_ids.append(int(cur.lastrowid))
 
+        if plan.tree_assignments is not None:
+            c.execute("UPDATE entities SET tree_id=NULL, level=NULL, hierarchy_path=NULL WHERE run_id=?", (self._run_id,))
+            for ta in plan.tree_assignments:
+                c.execute("UPDATE entities SET tree_id=?, level=?, hierarchy_path=? WHERE entity_id=? AND run_id=?",
+                          (ta.tree_id, ta.level, ta.hierarchy_path, ta.entity_id, self._run_id))
         for m in plan.merges:
             touched |= self._merge(m.keep_id, m.drop_id, now)
         for dm in plan.demotions:

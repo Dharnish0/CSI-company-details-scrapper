@@ -27,7 +27,11 @@ def test_help_in_process(capsys: pytest.CaptureFixture[str]):
     assert info.value.code == 0
     out = capsys.readouterr().out
     assert "init-db" in out
-    for forbidden in ("crawl", "export", "llm"):
+    # M0 forbade `export`; Excel export is now specified (ARCHITECTURE 11) and implemented, so the guard lists the real command
+    # set instead: anything else (an accidental `crawl` or `llm` command, say) is still caught.
+    for command in ("init-db", "run", "resume", "report", "export", "verify"):
+        assert f"\n    {command}" in out, command
+    for forbidden in ("crawl", "llm"):
         assert f"\n    {forbidden}" not in out
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -52,5 +53,6 @@ class ResearchDeps:
     agents: dict[str, Any]  # discovery, extraction, relationship, website (BaseAgent instances)
     advisor: AdvisorPort | None = None
     search: SearchService | None = None
+    export_path: Path | None = None  # when set, finalize writes the workbook there (build_tree -> export_excel)
     dedup: DedupPort | None = None
     scratch: dict[int, Any] = field(default_factory=dict)  # per-task bulky data, never in graph state

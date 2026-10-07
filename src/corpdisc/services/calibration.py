@@ -70,6 +70,7 @@ def build_report(conn: sqlite3.Connection, run_id: int) -> dict[str, Any]:
                 "cost_per_entity_usd": round(cost / non_root, 6) if non_root else None,
                 "tokens_per_entity": round(tokens / non_root, 1) if non_root else None,
                 "tool_calls_allowed": int(tool[0] or 0), "tool_calls_total": int(tool[1] or 0)},
+        "extraction": _extraction(conn, run_id),
         "tasks": tasks,
         "pages": _map(conn, "SELECT crawl_status, COUNT(*) FROM crawl_pages WHERE run_id=? GROUP BY 1", run_id),
         "gate_rejections": _map(conn, "SELECT gate_code, COUNT(*) FROM gate_rejections WHERE run_id=? GROUP BY 1", run_id),
@@ -81,6 +82,24 @@ def build_report(conn: sqlite3.Connection, run_id: int) -> dict[str, Any]:
     }
 
 
+def _extraction(conn: sqlite3.Connection, run_id: int) -> dict[str, Any]:
+    r = _rows(conn, f"""SELECT COUNT(*) attempts, SUM(CASE WHEN {_PROVIDER_CALL} THEN 1 ELSE 0 END) provider_calls,
+        SUM(CASE WHEN status='OK' AND cache_hit=0 THEN 1 ELSE 0 END) ok_calls, SUM(cache_hit) cache_hits,
+        SUM(CASE WHEN failure_kind='TRANSPORT' THEN 1 ELSE 0 END) transport_failures, SUM(CASE WHEN failure_kind='SCHEMA' THEN 1 ELSE 0 END) schema_failures,
+        SUM(CASE WHEN attempt>1 THEN 1 ELSE 0 END) retries, AVG(CASE WHEN cache_hit=0 AND latency_ms IS NOT NULL THEN latency_ms END) avg_ms,
+        MAX(latency_ms) max_ms, AVG(CASE WHEN cache_hit=0 AND tokens_in>0 THEN tokens_in END) avg_in, AVG(CASE WHEN cache_hit=0 AND tokens_out>0 THEN tokens_out END) avg_out,
+        SUM(COALESCE(latency_ms,0)) total_ms, SUM(CASE WHEN json_extract(response_json,'$.finish_reason')='length' THEN 1 ELSE 0 END) truncated,
+        AVG(json_extract(response_json,'$.provider_metrics.request_bytes')) avg_req_bytes, AVG(json_extract(response_json,'$.provider_metrics.eval_ms')) avg_eval_ms,
+        AVG(json_extract(response_json,'$.provider_metrics.prompt_eval_ms')) avg_prompt_eval_ms, MAX(json_extract(response_json,'$.provider_metrics.context_used_pct')) max_ctx_pct
+        FROM agent_invocations WHERE run_id=? AND agent='extraction'""", run_id)[0]
+    f = lambda v, nd=1: None if v is None else round(float(v), nd)  # noqa: E731
+    return {"attempts": int(r["attempts"] or 0), "provider_calls": int(r["provider_calls"] or 0), "ok_calls": int(r["ok_calls"] or 0), "cache_hits": int(r["cache_hits"] or 0),
+            "transport_failures": int(r["transport_failures"] or 0), "schema_failures": int(r["schema_failures"] or 0), "retries": int(r["retries"] or 0),
+            "truncated_outputs": int(r["truncated"] or 0), "avg_latency_ms": f(r["avg_ms"]), "max_latency_ms": f(r["max_ms"]), "total_llm_time_s": f((r["total_ms"] or 0) / 1000, 1),
+            "avg_tokens_in": f(r["avg_in"]), "avg_tokens_out": f(r["avg_out"]), "avg_request_bytes": f(r["avg_req_bytes"], 0), "avg_prompt_eval_ms": f(r["avg_prompt_eval_ms"]),
+            "avg_eval_ms": f(r["avg_eval_ms"]), "max_context_used_pct": f(r["max_ctx_pct"])}
+
+
 def format_report(rep: dict[str, Any]) -> str:
     r, e, l = rep["run"], rep["entities"], rep["llm"]
     lines = [
@@ -89,6 +108,7 @@ def format_report(rep: dict[str, Any]) -> str:
         f"  entities: {e['by_status']}  review ratio: {e['review_ratio']}  merged: {e['merged']}",
         f"  LLM: {l['provider_calls']} provider calls, {l['cache_hits']} cache hits (rate {l['cache_hit_rate']}), "
         f"{l['calls_per_task']} calls/task, ${l['cost_per_entity_usd']} per entity, {l['tokens_per_entity']} tokens per entity",
+        f"  extraction: {rep['extraction']}",
         f"  tasks: {rep['tasks']}   pages: {rep['pages']}",
         f"  gate rejections: {rep['gate_rejections']}   candidates: {rep['candidates']}",
         f"  review items: {rep['review_items']}   findings: {rep['findings']}   errors: {rep['errors']}",

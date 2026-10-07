@@ -41,8 +41,10 @@ from corpdisc.graphs.deps import ResearchDeps
 from corpdisc.graphs.support import DedupService, engine_for
 from corpdisc.logging_setup import get_logger
 from corpdisc.models.domain import ReviewReason
+from corpdisc.services.excel import export_workbook
 from corpdisc.services.matcher import MatchCandidate, compute_signals
 from corpdisc.services.normalize import normalize_name
+from corpdisc.services.tree import assign_tree_ids
 from corpdisc.services.validation_engine import Suspect
 
 log = get_logger("graphs.finalize")
@@ -84,7 +86,7 @@ class FinalizeGraph:
         self._semantic = False
         g = StateGraph(FinalizeState)
         names = ["finalize_init", "global_dedupe", "apply_merges", "run_checks", "validation_agent", "apply_outcomes",
-                 "finish"]
+                 "build_tree", "export_excel", "finish"]
         for n in names:
             g.add_node(n, getattr(self, f"n_{n}"))
         g.set_entry_point(names[0])
@@ -273,6 +275,20 @@ class FinalizeGraph:
                 FindingWrite(check_name=f["check_name"][:60], severity=f["severity"], entity_id=f.get("entity_id"),
                              details=f["details"][:500]) for f in all_findings)))
         return {"demotions": applied, "cascade": cascade, "findings": extra}
+
+    def n_build_tree(self, s: FinalizeState) -> dict:
+        row = self.d.conn.execute("SELECT root_code FROM runs WHERE run_id=?", (self.d.run_id,)).fetchone()
+        assign_tree_ids(self.d.conn, self.d.committer, self.d.run_id, (row[0] if row else None) or self.d.settings.root_code)
+        return {}
+
+    def n_export_excel(self, s: FinalizeState) -> dict:
+        if self.d.export_path is not None:  # reads the database only; a failed export never changes any data
+            try:
+                export_workbook(self.d.conn, self.d.run_id, self.d.export_path)
+            except Exception as exc:  # noqa: BLE001
+                log.error("excel export failed: %s", type(exc).__name__)
+                return {"findings": [{"check_name": "EXPORT_FAILED", "severity": "ERROR", "entity_id": None, "details": f"{type(exc).__name__}: {exc}"[:400]}]}
+        return {}
 
     def n_finish(self, s: FinalizeState) -> dict:
         final = engine_for(self.d).run()  # re-check after outcomes were applied

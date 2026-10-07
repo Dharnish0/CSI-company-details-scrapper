@@ -152,5 +152,6 @@ def build_runtime(
         calc=ConfidenceCalculator.from_settings(settings), verifier=QuoteVerifier(), runner=runner,
         agents={"discovery": DiscoveryAgent(), "extraction": ExtractionAgent(), "relationship": RelationshipAgent(),
                 "website": WebsiteAgent(), "advisor": AdvisorAgent(), "dedup": DedupAgent(), "validation": ValidationAgent()},
-        advisor=AdvisorService() if settings.advisor_enabled else None, dedup=DedupService(), search=search)
+        advisor=AdvisorService() if settings.advisor_enabled else None, dedup=DedupService(), search=search,
+        export_path=settings.output_xlsx)
     return Runtime(settings, conn, run_id, deps, Supervisor(deps, runs), provider, closers)

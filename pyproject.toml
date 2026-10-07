@@ -15,6 +15,7 @@ dependencies = [
     "beautifulsoup4==4.15.0",
     "tldextract==5.4.0",
     "langgraph==1.2.12",
+    "openpyxl==3.1.5",
 ]
 
 [project.optional-dependencies]

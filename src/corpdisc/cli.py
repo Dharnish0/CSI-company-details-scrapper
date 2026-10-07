@@ -29,6 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--yes", action="store_true", help="confirm that a real (billable) LLM provider may be used")
         if name == "resume":
             sp.add_argument("--run-id", type=int, default=None)
+    ep = sub.add_parser("export", help="assign Tree IDs and write the Excel workbook from the database")
+    ep.add_argument("--run-id", type=int, default=None)
+    ep.add_argument("--output", type=str, default=None, help="workbook path (default OUTPUT_XLSX)")
+    vp = sub.add_parser("verify", help="re-check data quality from the database (evidence grounding, duplicates, cycles ...)")
+    vp.add_argument("--run-id", type=int, default=None)
     rp = sub.add_parser("report", help="print the calibration report (calls, cost, cache rate, review ratio)")
     rp.add_argument("--run-id", type=int, default=None)
     rp.add_argument("--json", action="store_true", help="machine-readable output")
@@ -122,6 +127,81 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool) -> int:
         rt.close()
 
 
+def _stack(settings, run_id: int, *, write: bool):  # type: ignore[no-untyped-def]
+    """Database-only services (no HTTP client, no LLM): enough to number the tree and to re-verify evidence."""
+    from corpdisc.clock import SystemClock
+    from corpdisc.db.connection import connect_readonly, connect_writer
+    from corpdisc.db.repos.pages import PageRepo
+    from corpdisc.services.committer import Committer
+    from corpdisc.services.fetch import make_page_text_loader
+    from corpdisc.services.pagecache import PageCache
+
+    conn = connect_writer(settings.db_path) if write else connect_readonly(settings.db_path)
+    clock = SystemClock()
+    loader = make_page_text_loader(PageRepo(conn, clock), PageCache(settings.cache_dir))
+    return conn, loader, Committer.from_settings(conn, run_id=run_id, page_text=loader, settings=settings, clock=clock)
+
+
+def _resolve_run(settings, run_id):  # type: ignore[no-untyped-def]
+    from corpdisc.app import latest_run_id
+    from corpdisc.db.connection import connect_readonly
+
+    c = connect_readonly(settings.db_path)
+    try:
+        return run_id or latest_run_id(c)
+    finally:
+        c.close()
+
+
+def _cmd_export(args: argparse.Namespace) -> int:
+    from corpdisc.services.excel import export_workbook
+    from corpdisc.services.tree import assign_tree_ids
+
+    settings = _load(setup=False)
+    if settings is None:
+        return 2
+    rid = _resolve_run(settings, args.run_id)
+    if rid is None:
+        print("No runs in the database.", file=sys.stderr)
+        return 2
+    conn, _, committer = _stack(settings, rid, write=True)
+    try:
+        root_code = conn.execute("SELECT root_code FROM runs WHERE run_id=?", (rid,)).fetchone()[0] or settings.root_code
+        rows = assign_tree_ids(conn, committer, rid, root_code)
+        summ = export_workbook(conn, rid, args.output or settings.output_xlsx)
+    except (LookupError, RuntimeError, DatabaseError) as exc:
+        print(f"Cannot export: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+    print(f"Run {rid}: numbered {len(rows)} confirmed entities; wrote {summ.path}")
+    for sheet, n in summ.sheets.items():
+        print(f"  {sheet:<18} {n} rows")
+    return 0
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    from corpdisc.services.cycle_guard import CycleGuard
+    from corpdisc.services.data_quality import check_run, format_checks
+
+    settings = _load(setup=False)
+    if settings is None:
+        return 2
+    rid = _resolve_run(settings, args.run_id)
+    if rid is None:
+        print("No runs in the database.", file=sys.stderr)
+        return 2
+    conn, loader, committer = _stack(settings, rid, write=False)
+    try:
+        checks = check_run(conn, rid, committer=committer, cycle=CycleGuard(conn), page_text=loader,
+                           shared_domains=frozenset(d.lower() for d in settings.shared_platform_domains))
+    finally:
+        conn.close()
+    print(f"Data-quality verification of run {rid}:")
+    print(format_checks(checks))
+    return 1 if any(c.status == "FAIL" for c in checks) else 0
+
+
 def _cmd_report(args: argparse.Namespace) -> int:
     import json
 
@@ -157,5 +237,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_run(args, resume=args.command == "resume")
     if args.command == "report":
         return _cmd_report(args)
+    if args.command == "export":
+        return _cmd_export(args)
+    if args.command == "verify":
+        return _cmd_verify(args)
     parser.print_help()
     return 0

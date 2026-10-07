@@ -188,6 +188,15 @@ class FindingWrite(Strict):
     action_taken: str | None = Field(default=None, max_length=200)
 
 
+class TreeAssignWrite(Strict):
+    """level / tree_id / hierarchy_path of one CONFIRMED entity (written only at finalize / export)."""
+
+    entity_id: int = Field(ge=1)
+    tree_id: str = Field(min_length=1, max_length=120)
+    level: int = Field(ge=0)
+    hierarchy_path: str = Field(min_length=1, max_length=2000)
+
+
 class CommitPlan(Strict):
     """One transaction. Built only by the runtime; never from raw agent output."""
 
@@ -205,6 +214,7 @@ class CommitPlan(Strict):
     gate_rejections: tuple[GateRejectionWrite, ...] = ()
     findings: tuple[FindingWrite, ...] = ()
     merges: tuple[MergeWrite, ...] = ()
+    tree_assignments: tuple[TreeAssignWrite, ...] | None = None  # None = untouched; a tuple (even empty) resets then assigns
     demotions: tuple[DemotionWrite, ...] = ()
 
     @model_validator(mode="after")
