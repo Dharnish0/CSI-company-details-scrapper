@@ -18,3 +18,5 @@ logs/*
 *.db-wal
 *.db-shm
 *.xlsx
+preflight_out/
+forensics_out/

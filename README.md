@@ -4,7 +4,7 @@ Purpose: discover and verify a corporate hierarchy (operating groups, portfolio 
 
 Design reference: [ARCHITECTURE.md](ARCHITECTURE.md). Part II (multi-agent architecture) is the target implementation. Part I (deterministic foundation and data model) is preserved: SQLite is the source of truth, deterministic control stays in Python, and nothing is accepted without verifiable evidence.
 
-## Status: M0-M8 implemented (live calibration pending)
+## Status: M0-M8 implemented, Excel export (M9) added; real-CSI validation pending on your machine
 
 | Milestone | What | State |
 |---|---|---|
@@ -15,7 +15,7 @@ Design reference: [ARCHITECTURE.md](ARCHITECTURE.md). Part II (multi-agent archi
 | M4 | Supervisor runtime, `research_entity` and `finalize` graphs (LangGraph), fixture hierarchy | done |
 | M5-M7 | Extraction, Relationship Verification, Discovery, Website Resolution, Deduplication, Validation, Advisor | done (verified with scripted/fake models) |
 | M8 | Real provider adapters (Anthropic, OpenAI-compatible), composition root, `run`/`resume`/`report`, calibration report, opt-in live tests | code and offline tests done; **live calibration not yet run** |
-| M9 | Tree IDs and Excel export | not started |
+| M9 | Tree IDs, Excel export, `verify` | implemented and tested on fixtures; not yet run on real CSI data |
 
 Agents only *propose*. Deterministic gates, the Committer and its invariants decide what is stored, and SQLite is the source of truth. The default test suite uses scripted fake models and a local in-memory site: it needs no API key, no network and no real website.
 
@@ -23,12 +23,33 @@ Agents only *propose*. Deterministic gates, the Committer and its invariants dec
 
 ```powershell
 python main.py init-db
-python main.py run                 # new run from START_URL / ROOT_COMPANY (see .env)
-python main.py resume              # continue after a pause or interruption
-python main.py report [--json]     # calls, tokens, cost, cache rate, review ratio, gate rejections
+python main.py run --yes --max-tasks 1   # new run from START_URL / ROOT_COMPANY (see .env); stops after 1 task, resumable
+python main.py resume --yes              # continue after a pause or interruption
+python main.py report [--json]           # calls, tokens, cost, cache rate, review ratio, extraction latency/tokens/retries
+python main.py verify                    # re-check data quality from SQLite (evidence grounded in STORED pages, cycles, duplicates ...)
+python main.py export [--output PATH]    # assign Tree IDs and write CSI_Company_Hierarchy.xlsx from SQLite
 ```
 
-With no LLM configured, `run` pauses cleanly (the circuit breaker opens) instead of crashing. A billable provider needs `LLM_PROVIDER` (`anthropic` or `openai`), `LLM_API_KEY`, `LLM_MODEL` in `.env` (never committed) and an explicit `--yes`. Set `LLM_TOKEN_BUDGET`, `MAX_TOTAL_PAGES` and `MAX_DEPTH` first. `LLM_RECORD_TO=path.jsonl` records every successful response; `LLM_PROVIDER=replay` replays that cassette and fails closed on a miss (it never falls through to a live provider).
+With no LLM configured, `run` pauses cleanly (the circuit breaker opens) instead of crashing.
+
+### Local Ollama (qwen3:4b)
+
+The provider is **native Ollama** (`/api/chat`): it sends a real output cap (`num_predict`), an explicit context (`OLLAMA_NUM_CTX`, default 12288),
+`think=false` for structured extraction (`LLM_EXTRACTION_REASONING=none`), the JSON schema as a grammar and in the prompt, and records
+`finish_reason`, tokens and prompt-eval/eval/load times per call. A timeout is never retried identically; extraction stops at the first
+transport failure; output cut at the cap (`finish_reason=length`) is reported, not "repaired".
+
+```powershell
+# .env: LLM_PROVIDER=ollama  LLM_MODEL=qwen3:4b  START_URL=https://www.constellationsoftware.com/  ROOT_COMPANY="Constellation Software Inc."
+#       ROOT_CODE=CSI  DB_PATH=./data/csi_validation.db  OLLAMA_NUM_CTX=12288  LLM_EXTRACTION_REASONING=none  LLM_TIMEOUT_SECONDS=300
+ollama pull qwen3:4b
+python scripts/ollama_preflight.py            # measures version / model / RAM / GPU / context, runs controlled extraction tests A-C
+python main.py init-db
+python main.py run --yes --max-tasks 1        # Test D: the exact application request on the REAL pages
+python main.py report ; python main.py verify
+python main.py run --yes --max-tasks 5        # only if the first task was healthy
+python main.py verify ; python main.py export
+```
 
 ## Live calibration (opt-in, billable)
 
