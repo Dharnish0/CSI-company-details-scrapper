@@ -28,7 +28,7 @@ class RunRepo:
         return int(cur.lastrowid)
 
     def set_status(self, run_id: int, status: RunStatus) -> None:
-        done = status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.BUDGET_EXHAUSTED)
+        done = status in (RunStatus.COMPLETED, RunStatus.PARTIAL, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.BUDGET_EXHAUSTED)
         with self._conn:
             self._conn.execute("UPDATE runs SET status = ?, finished_at = ? WHERE run_id = ?",
                                (status.value, iso_utc(self._clock.now()) if done else None, run_id))

@@ -180,7 +180,7 @@ def test_one_crashing_task_does_not_kill_the_run(tmp_path):
 
     w.deps.fetch.fetch = flaky
     s = w.sup.run()
-    assert s.status == "COMPLETED" and s.failed_tasks == 1
+    assert s.status == "PARTIAL" and s.failed_tasks == 1  # a permanently failed task is never reported as full success
     row = w.q("SELECT status, attempts FROM research_queue WHERE entity_id=?", w.entity("Company B1")["entity_id"])[0]
     assert tuple(row) == ("FAILED", 3)
     assert {"Company A1", "A1 Labs", "Group B"} <= w.names("CONFIRMED") and w.q("SELECT 1 FROM crawl_errors WHERE stage='TASK'")

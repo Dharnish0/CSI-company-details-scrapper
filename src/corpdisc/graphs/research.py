@@ -97,7 +97,8 @@ _OWNERSHIP_WORDING: Final = re.compile(
     r"\b(subsidiar\w*|owned|owns|acquired|division of|part of|a company of|member of|portfolio company|"
     r"operating group of|business group of|wholly)\b", re.I)
 from corpdisc.services.wording import NEGATIVE_WORDING  # noqa: E402  (shared with the data-quality verifier)
-Outcome = Literal["EXPANDED", "TERMINAL", "UNREACHABLE", "PARTIAL", "BUDGET_STOPPED", "SKIPPED", "NO_WEBSITE"]
+Outcome = Literal["EXPANDED", "TERMINAL", "UNREACHABLE", "PARTIAL", "BUDGET_STOPPED", "SKIPPED", "NO_WEBSITE",
+                 "RETRY_LATER"]
 
 
 # ------------------------------------------------------------------ state
@@ -111,6 +112,8 @@ class TaskCtx(BaseModel):
     depth: int = 0
     parent_entity_id: int | None = None
     ancestry: list[int] = Field(default_factory=list)
+    attempt: int = 1  # which try of this task this is (queue.attempts after the claim)
+    max_attempts: int = 1  # retry cap for transient provider failures; on the last attempt work completes as PARTIAL
 
 
 class Cand(BaseModel):
@@ -157,6 +160,7 @@ class Cand(BaseModel):
     ent_conf: float = 0.0
     review_reason: str | None = None
     final_type: str | None = None
+    rel_unavailable: bool = False  # the relationship call for this candidate's batch failed
 
 
 class ResearchState(BaseModel):
@@ -171,6 +175,8 @@ class ResearchState(BaseModel):
     enqueued_task_ids: list[int] = Field(default_factory=list)
     partial: bool = False
     rel_unavailable: bool = False
+    retry_after_s: float | None = None
+    retry_reason: str = ""
     outcome: Outcome | None = None
     budget_scope: Literal["task", "run"] | None = None
     ref_ids: dict[str, int] = Field(default_factory=dict)
@@ -189,6 +195,8 @@ class ResearchResult:
     errors: tuple[str, ...]
     budget_scope: str | None
     gate_rejections: int
+    retry_after_s: float | None = None
+    retry_reason: str = ""
 
 
 @dataclass
@@ -270,7 +278,8 @@ class ResearchGraph:
     NODES = ("claim_and_gate", "fetch_entry", "index_links", "route_discovery", "discovery_agent", "gate_pages",
              "fetch_pages", "build_extraction_inputs", "extraction_agent", "gate_extraction", "match_known",
              "route_website", "website_agent", "gate_website", "dedupe_resolve", "relationship_agent",
-             "verify_and_score", "commit", "route_enqueue", "mark_terminal", "mark_unreachable", "finish")  # fmt: skip
+             "verify_and_score", "commit", "route_enqueue", "mark_terminal", "mark_unreachable", "defer_retry",
+             "finish")  # fmt: skip
 
     def __init__(self, deps: ResearchDeps) -> None:
         self.d = deps
@@ -298,7 +307,8 @@ class ResearchGraph:
             self.d.scratch.pop(task.task_id, None)
         st = final if isinstance(final, ResearchState) else ResearchState(**final)
         return ResearchResult(st.outcome or "TERMINAL", tuple(st.committed_ids), tuple(st.enqueued_task_ids),
-                              tuple(st.errors), st.budget_scope, len(st.rejections))
+                              tuple(st.errors), st.budget_scope, len(st.rejections),
+                              st.retry_after_s, st.retry_reason)
 
     # --------------------------------------------------------------- helpers
     def sc(self, s: ResearchState) -> Scratch:
@@ -330,6 +340,12 @@ class ResearchGraph:
         if resp.status is not CallStatus.OK:
             extra["errors"] = [f"{key}:{resp.status}:{resp.error.kind if resp.error else ''}"]
         return resp, extra
+
+    @staticmethod
+    def should_retry_later(s: ResearchState, resp: AgentResponse) -> bool:
+        """A transient provider failure (429, timeout, 5xx) with attempts left: reschedule instead of degrading."""
+        return bool(resp.status is CallStatus.FAILED and resp.error is not None and resp.error.retryable
+                    and s.task.attempt < s.task.max_attempts)
 
     @staticmethod
     def budget_reason(resp: AgentResponse) -> str | None:
@@ -546,6 +562,7 @@ class ResearchGraph:
         parent = self.card(t.entity_id, t.entity_name)
         allowed = [x for x in EntityType if x not in (EntityType.PARENT_COMPANY, EntityType.UNKNOWN)]
         partial, errors, rej, inv_reviews = False, [], [], []
+        retry_resp: AgentResponse | None = None
         for key, ch in sc.chunks.items():
             payload = ExtractionInput(
                 parent=parent, chunk_index=ch["index"], chunk_count=ch["count"], dom_candidates=ch["dom"],
@@ -559,6 +576,8 @@ class ResearchGraph:
                 return self.stop(why, "run")
             if resp.status is not CallStatus.OK or resp.payload is None:
                 partial = True
+                if retry_resp is None and self.should_retry_later(s, resp):
+                    retry_resp = resp
                 rej.append(_rej("G12", key, f"extraction failed: {resp.error.message if resp.error else ''}"))
                 if resp.error is not None and resp.error.kind in (FailureKind.TRANSPORT, FailureKind.CIRCUIT_OPEN):
                     errors.append("extraction stopped: provider unavailable, remaining chunks not attempted")
@@ -572,6 +591,9 @@ class ResearchGraph:
                 if again.status is CallStatus.OK and again.payload is not None:
                     resp = again
             sc.extractions.append((key, resp.payload))
+        if retry_resp is not None:  # cached chunk results are served from the response cache when the task is re-run
+            return {"errors": [*errors, "extraction: transient failure, task will be retried"], "route": "defer_retry",
+                    "retry_after_s": retry_resp.error.retry_after_s, "retry_reason": "EXTRACTION_RETRY_PENDING"}
         route = "gate_extraction" if sc.extractions else "mark_terminal"
         upd: dict[str, Any] = {"errors": errors, "rejections": rej, "partial": partial, "route": route}
         if partial and not sc.extractions:
@@ -838,7 +860,13 @@ class ResearchGraph:
                     c.assess = a.model_dump(mode="json") if a else None
                     c.rel_extra = []
             else:
+                if self.should_retry_later(s, resp):  # keep the candidates, retry the verification later
+                    return {"errors": [*errors, "relationship: transient failure, task will be retried"],
+                            "route": "defer_retry", "retry_after_s": resp.error.retry_after_s,
+                            "retry_reason": "VERIFICATION_RETRY_PENDING"}
                 unavailable = True
+                for c in batch:
+                    c.rel_unavailable = True
         return {"cands": s.cands, "errors": errors, "rel_unavailable": unavailable, "route": "verify_and_score"}
 
     def n_verify_and_score(self, s: ResearchState) -> dict[str, Any]:
@@ -883,17 +911,15 @@ class ResearchGraph:
             # SUPPORTED only counts when at least one of its own quotes verified against the stored page text.
             supported = bool(a and a["support"] == "SUPPORTED" and rel_claim_ok)
             etype = (a or {}).get("final_entity_type") or c.proposed_type or EntityType.UNKNOWN.value
-            # CRITICAL FIX: When relationship verification is unavailable, upgrade to REVIEW_REQUIRED
-            # regardless of confidence score. This allows recursive discovery even when quotes
-            # can't be verified against stored page text. This handles cases like Vela where the
-            # extraction agent confidently identifies an entity but the verification step fails
-            # due to network issues or missing page text.
-            if s.rel_unavailable and status is not VerificationStatus.REJECTED:
+            # When the relationship call for this candidate's batch failed (after the retry cap), the child is kept as
+            # REVIEW_REQUIRED / VERIFICATION_UNAVAILABLE. REVIEW_REQUIRED children are not enqueued for crawling unless
+            # RECURSE_INTO_REVIEW is set: ownership was never verified, so nothing is confirmed or recursed into.
+            if c.rel_unavailable and status is not VerificationStatus.REJECTED:
                 status, reason = VerificationStatus.REVIEW_REQUIRED, ReviewReason.VERIFICATION_UNAVAILABLE
             elif status is VerificationStatus.CONFIRMED:
                 downgrade = None
-                if not supported or s.rel_unavailable:
-                    downgrade = (ReviewReason.VERIFICATION_UNAVAILABLE if s.rel_unavailable
+                if not supported or c.rel_unavailable:
+                    downgrade = (ReviewReason.VERIFICATION_UNAVAILABLE if c.rel_unavailable
                                  else ReviewReason.NO_QUOTE if a and a["support"] == "SUPPORTED"
                                  else ReviewReason.LOW_CONFIDENCE)
                 elif not check_g11_evidence_requirement(tuple(ev_list), True).allowed:
@@ -1047,6 +1073,18 @@ class ResearchGraph:
     def n_mark_terminal(self, s: ResearchState) -> dict[str, Any]:
         self._flush(s)
         return {"outcome": s.outcome or "TERMINAL", "route": "finish"}
+
+    def n_defer_retry(self, s: ResearchState) -> dict[str, Any]:
+        """Transient provider failure with attempts left: persist only candidate audit rows (decision REVIEW, reason
+        VERIFICATION_RETRY_PENDING) so extracted candidates are not lost, create no entities, and ask the supervisor to
+        reschedule the task. Candidate rows are upserted, so the re-run converges on the same rows."""
+        rows = list(s.cand_rows)
+        for c in s.cands:
+            if not c.dropped and c.status is None:
+                rows.append(self._row(self.sc(s).chunks[c.chunk_key], c.name, c.kind, "REVIEW", s.retry_reason or "RETRY_PENDING", None))
+        if rows:
+            self.n_commit(s.model_copy(update={"cands": [], "cand_rows": rows, "rejections": [], "reviews": [], "partial": False}))
+        return {"outcome": "RETRY_LATER", "route": "finish"}
 
     def n_mark_unreachable(self, s: ResearchState) -> dict[str, Any]:
         self._flush(s)

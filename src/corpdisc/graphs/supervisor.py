@@ -12,8 +12,9 @@ from __future__ import annotations
 import json
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import timedelta
 
-from corpdisc.clock import Clock
+from corpdisc.clock import Clock, Sleeper
 from corpdisc.config import Settings
 from corpdisc.contracts.postgate import CommitPlan, CommitRejected, EntityWrite, TaskWrite, WebsiteWrite, EntityRef
 from corpdisc.db.repos.runs import RunRepo
@@ -21,7 +22,15 @@ from corpdisc.graphs.deps import ResearchDeps
 from corpdisc.graphs.finalize import FinalizeGraph, FinalizeResult
 from corpdisc.graphs.research import ResearchGraph, TaskCtx
 from corpdisc.logging_setup import get_logger
-from corpdisc.models.domain import CrawlState, EntityType, OperatingStatus, RunStatus, VerificationStatus, WebsiteKind
+from corpdisc.models.domain import (
+    CrawlState,
+    EntityType,
+    OperatingStatus,
+    QueueStatus,
+    RunStatus,
+    VerificationStatus,
+    WebsiteKind,
+)
 from corpdisc.services.normalize import normalize_name, registrable_domain
 from corpdisc.services.urls import canonicalize_url
 
@@ -40,6 +49,9 @@ class RunSummary:
     processed: int = 0
     outcomes: Counter = field(default_factory=Counter)
     failed_tasks: int = 0
+    retries: int = 0  # tasks rescheduled after a transient provider failure
+    waited_seconds: float = 0.0  # time slept waiting for rescheduled tasks
+    queue_detail: dict[str, int] = field(default_factory=dict)
     finalize: FinalizeResult | None = None
 
 
@@ -64,9 +76,10 @@ def init_run(repo: RunRepo, settings: Settings, *, run_provider: str | None = No
 
 
 class Supervisor:
-    def __init__(self, deps: ResearchDeps, runs: RunRepo) -> None:
+    def __init__(self, deps: ResearchDeps, runs: RunRepo, sleeper: Sleeper | None = None) -> None:
         self.d = deps
         self.runs = runs
+        self.sleeper = sleeper or (deps.clock if isinstance(deps.clock, Sleeper) else None)
         self.research = ResearchGraph(deps)
         self.finalize_graph = FinalizeGraph(deps)
 
@@ -109,6 +122,7 @@ class Supervisor:
         self.runs.set_status(d.run_id, RunStatus.RUNNING)
         summary = RunSummary(status=RunStatus.RUNNING.value, stopped_reason="")
         breaker = d.runner.gateway.breaker
+        idle_waits = 0
         while True:
             if max_tasks is not None and summary.processed >= max_tasks:
                 summary.stopped_reason = "MAX_TASKS"
@@ -121,11 +135,26 @@ class Supervisor:
                 return self._stop(summary, RunStatus.BUDGET_EXHAUSTED, run_finalize=run_finalize)
             task = d.queue.claim_next(d.run_id)
             if task is None:
+                ready_at = d.queue.next_ready_time(d.run_id)
+                if ready_at is not None:  # rescheduled work is waiting: wait if short, else pause (resumable)
+                    wait = max(0.0, (ready_at - d.clock.now()).total_seconds())
+                    if wait <= d.settings.queue_retry_wait_max_seconds and self.sleeper is not None and idle_waits < 1000:
+                        idle_waits += 1
+                        log.info("queue: waiting %.1fs for rescheduled tasks", wait)
+                        self.sleeper.sleep(wait + 0.001)
+                        summary.waited_seconds += wait
+                        continue
+                    summary.stopped_reason = "RETRY_WAITING"
+                    summary.queue_detail = d.queue.counts_detail(d.run_id)
+                    return self._stop(summary, RunStatus.PAUSED, run_finalize=False)
                 summary.stopped_reason = "QUEUE_EMPTY"
-                return self._stop(summary, RunStatus.COMPLETED, run_finalize=run_finalize)
+                status = self.final_status()
+                summary.queue_detail = d.queue.counts_detail(d.run_id)
+                return self._stop(summary, status, run_finalize=run_finalize)
             summary.processed += 1
             ctx = TaskCtx(run_id=d.run_id, task_id=task.task_id, entity_id=task.entity_id, start_url=task.start_url,
-                          depth=task.depth, parent_entity_id=task.parent_entity_id)
+                          depth=task.depth, parent_entity_id=task.parent_entity_id, attempt=task.attempts,
+                          max_attempts=d.queue.max_attempts)
             log.info("Processing entity %s (task %s, depth %s)", task.entity_id, task.task_id, task.depth)
             try:
                 result = self.research.run(ctx)
@@ -141,6 +170,15 @@ class Supervisor:
                 summary.processed -= 1
                 summary.stopped_reason = "CIRCUIT_OPEN"
                 return self._stop(summary, RunStatus.PAUSED, run_finalize=False)
+            if result.outcome == "RETRY_LATER":
+                delay = max(result.retry_after_s or 0.0, d.settings.queue_retry_base_seconds * 2 ** (task.attempts - 1))
+                reason = f"{result.retry_reason or 'RETRY_PENDING'} (attempt {task.attempts}/{d.queue.max_attempts})"
+                d.queue.reschedule(task.task_id, d.clock.now() + timedelta(seconds=delay), reason)
+                log.warning("task %s rescheduled in %.0fs: %s", task.task_id, delay, reason)
+                summary.outcomes["RETRY"] += 1
+                summary.retries += 1
+                summary.processed -= 1  # a retry does not count toward --max-tasks
+                continue
             summary.outcomes[result.outcome] += 1
             self._release(task.task_id, result)
             if result.outcome == "BUDGET_STOPPED" and result.budget_scope == "run":
@@ -153,8 +191,29 @@ class Supervisor:
             q.skip(task_id, (result.errors[-1] if result.errors else "budget")[:300], CrawlState.BUDGET_STOPPED)
         elif result.outcome == "SKIPPED":
             q.skip(task_id, (result.errors[-1] if result.errors else "skipped")[:300], CrawlState.SKIPPED)
+        elif result.outcome == "PARTIAL":  # finished with gaps (e.g. verification unavailable after the retry cap)
+            note = (result.errors[-1] if result.errors else "INCOMPLETE")[:200]
+            q.complete(task_id, OUTCOME_TO_STATE["PARTIAL"], note=f"{q.PARTIAL_PREFIX}{note}")
         else:
             q.complete(task_id, OUTCOME_TO_STATE.get(result.outcome, CrawlState.TERMINAL))
+
+    def final_status(self) -> RunStatus:
+        """Status when the queue is empty, derived from the DB so it survives resume.
+
+        FAILED: the root task failed, or tasks failed and none finished. PARTIAL: any task FAILED, finished with gaps
+        (``PARTIAL:`` note: verification or extraction was unavailable). COMPLETED: none of those. Review rows are not used:
+        a task interrupted by the circuit breaker leaves rows that its successful re-run supersedes.
+        """
+        d = self.d
+        detail = d.queue.counts_detail(d.run_id)
+        done = d.queue.counts(d.run_id)[QueueStatus.DONE]
+        root_failed = d.conn.execute("SELECT 1 FROM research_queue WHERE run_id=? AND depth=0 AND status='FAILED'",
+                                     (d.run_id,)).fetchone()
+        if root_failed or (detail["failed"] > 0 and done == 0):
+            return RunStatus.FAILED
+        if detail["failed"] > 0 or detail["partial"] > 0:
+            return RunStatus.PARTIAL
+        return RunStatus.COMPLETED
 
     def _stop(self, summary: RunSummary, status: RunStatus | None, *, run_finalize: bool) -> RunSummary:
         if run_finalize:

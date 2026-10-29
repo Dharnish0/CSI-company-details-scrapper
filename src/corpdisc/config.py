@@ -100,6 +100,10 @@ class Settings(BaseSettings):
     llm_rate_limit_retries: int = Field(default=5, ge=0)  # 429 retries inside one call (do not use the 5xx retry count)
     llm_retry_after_ceiling_seconds: float = Field(default=120.0, ge=0)  # longer Retry-After => defer the task instead
     llm_temperature: float = Field(default=0.0, ge=0, le=2)
+    # Queue recovery: transient provider failures reschedule the task (attempts kept) instead of ending discovery
+    queue_max_attempts: int = Field(default=3, ge=1)
+    queue_retry_base_seconds: float = Field(default=60.0, ge=0)  # backoff = base * 2**(attempt-1), or Retry-After if larger
+    queue_retry_wait_max_seconds: float = Field(default=300.0, ge=0)  # longer waits pause the run (resumable)
     llm_cassette_dir: Path = Path("./.cache/llm_cassettes")
     # M8 real providers
     llm_timeout_seconds: float = Field(default=300.0, gt=0)

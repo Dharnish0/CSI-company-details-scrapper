@@ -136,8 +136,40 @@ class QueueService:
                 self._conn.execute("UPDATE entities SET crawl_state = ? WHERE entity_id = ?",
                                    (crawl_state.value, row["entity_id"]))
 
-    def complete(self, task_id: int, crawl_state: CrawlState | None = None) -> None:
-        self._finish(task_id, QueueStatus.DONE, None, crawl_state)
+    PARTIAL_PREFIX: Final = "PARTIAL:"
+
+    def complete(self, task_id: int, crawl_state: CrawlState | None = None, note: str | None = None) -> None:
+        """Mark DONE. ``note`` (e.g. ``PARTIAL:VERIFICATION_UNAVAILABLE``) records that work finished with gaps."""
+        self._finish(task_id, QueueStatus.DONE, note[:500] if note else None, crawl_state)
+
+    def reschedule(self, task_id: int, not_before: datetime, error: str) -> None:
+        """Retry later: back to PENDING with a future ``not_before``. Unlike ``defer``, ``attempts`` is kept so the
+        retry cap is enforced; the failure reason stays visible in ``error``."""
+        with self._tx():
+            self._conn.execute(
+                "UPDATE research_queue SET status = 'PENDING', not_before = ?, finished_at = NULL, error = ? "
+                "WHERE task_id = ? AND status = 'RUNNING'",
+                (iso_utc(not_before), error[:500], task_id),
+            )
+
+    def next_ready_time(self, run_id: int) -> datetime | None:
+        """Earliest ``not_before`` among PENDING tasks (None when nothing is waiting)."""
+        row = self._conn.execute(
+            "SELECT MIN(not_before) FROM research_queue WHERE run_id = ? AND status = 'PENDING' "
+            "AND not_before IS NOT NULL", (run_id,)).fetchone()
+        return parse_iso_utc(row[0]) if row and row[0] else None
+
+    def counts_detail(self, run_id: int) -> dict[str, int]:
+        """FAILED tasks, DONE tasks finished with gaps (``PARTIAL:`` note) and PENDING tasks waiting on ``not_before``."""
+        c = self._conn
+        failed = c.execute("SELECT COUNT(*) FROM research_queue WHERE run_id=? AND status='FAILED'", (run_id,)).fetchone()[0]
+        partial = c.execute("SELECT COUNT(*) FROM research_queue WHERE run_id=? AND status='DONE' AND error LIKE 'PARTIAL:%'",
+                            (run_id,)).fetchone()[0]
+        waiting = c.execute("SELECT COUNT(*) FROM research_queue WHERE run_id=? AND status='PENDING' AND not_before IS NOT NULL "
+                            "AND not_before > ?", (run_id, iso_utc(self._clock.now()))).fetchone()[0]
+        clean = c.execute("SELECT COUNT(*) FROM research_queue WHERE run_id=? AND status='DONE' "
+                          "AND (error IS NULL OR error NOT LIKE 'PARTIAL:%')", (run_id,)).fetchone()[0]
+        return {"failed": failed, "partial": partial, "waiting": waiting, "done_clean": clean}
 
     def skip(self, task_id: int, reason: str, crawl_state: CrawlState | None = CrawlState.SKIPPED) -> None:
         self._finish(task_id, QueueStatus.SKIPPED, reason[:500], crawl_state)

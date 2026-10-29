@@ -59,7 +59,7 @@ def test_enum_sizes_and_values():
     assert len(CandidateKind) == 11 and len(ReviewReason) == 13
     assert len(PageType) == 18
     assert {"PARTNERS", "CUSTOMERS", "CASE_STUDIES", "CAREERS", "BLOG", "NEWS"} <= {p.value for p in PageType}
-    assert len(RunStatus) == 6 and len(WebsiteKind) == 3
+    assert len(RunStatus) == 7 and len(WebsiteKind) == 3
 
 
 @pytest.mark.parametrize("enum_cls", [

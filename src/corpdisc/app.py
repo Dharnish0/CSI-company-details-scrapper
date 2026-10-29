@@ -195,11 +195,11 @@ def build_runtime(
                                         settings=settings, clock=clock)
     deps = ResearchDeps(
         conn=conn, run_id=run_id, settings=settings, clock=clock, fetch=fetch, pages_repo=pages,
-        queue=QueueService(conn, clock), budget=budget, cycle=CycleGuard(conn),
+        queue=QueueService(conn, clock, max_attempts=settings.queue_max_attempts), budget=budget, cycle=CycleGuard(conn),
         matcher=Matcher.from_settings(conn, run_id, settings), committer=committer,
         calc=ConfidenceCalculator.from_settings(settings), verifier=QuoteVerifier(), runner=runner,
         agents={"discovery": DiscoveryAgent(), "extraction": ExtractionAgent(), "relationship": RelationshipAgent(),
                 "website": WebsiteAgent(), "advisor": AdvisorAgent(), "dedup": DedupAgent(), "validation": ValidationAgent()},
         advisor=AdvisorService() if settings.advisor_enabled else None, dedup=DedupService(), search=search,
         export_path=settings.output_xlsx)
-    return Runtime(settings, conn, run_id, deps, Supervisor(deps, runs), provider, closers)
+    return Runtime(settings, conn, run_id, deps, Supervisor(deps, runs, sleeper), provider, closers)
