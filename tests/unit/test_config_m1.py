@@ -68,9 +68,14 @@ def test_m1_setting_ranges_are_validated(kwargs):
         make(**kwargs)
 
 
+# Runtime-only fields that should not be in .env.example (CLI override only)
+RUNTIME_ONLY_FIELDS = {"run_provider", "run_model"}
+
+
 def test_env_example_lists_every_setting():
     text = (ROOT / ".env.example").read_text(encoding="utf-8")
     names = {line.split("=", 1)[0].strip() for line in text.splitlines()
              if "=" in line and not line.lstrip().startswith("#")}
-    missing = [f.upper() for f in Settings.model_fields if f.upper() not in names]
+    missing = [f.upper() for f in Settings.model_fields 
+               if f.upper() not in names and f not in RUNTIME_ONLY_FIELDS]
     assert not missing, f".env.example missing {missing}"

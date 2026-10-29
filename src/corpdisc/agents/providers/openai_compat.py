@@ -17,13 +17,14 @@ class OpenAICompatProvider:
     name = "openai"
 
     def __init__(self, *, api_key: str, transport: JsonTransport, base_url: str = "", timeout: float = 60.0,
-                 price_in_per_mtok: float = 0.0, price_out_per_mtok: float = 0.0) -> None:
+                 price_in_per_mtok: float = 0.0, price_out_per_mtok: float = 0.0, model_name: str = "gpt-4.1-mini") -> None:
         # API key is optional for OpenAI-compatible providers (e.g., local Ollama)
         self._key = api_key
         self._t = transport
         self._url = (base_url.rstrip("/") or "https://api.openai.com") + "/v1/chat/completions"
         self._timeout = timeout
         self._pin, self._pout = price_in_per_mtok, price_out_per_mtok
+        self._model_name = model_name.strip() or "gpt-4.1-mini"
 
     def __repr__(self) -> str:
         return "OpenAICompatProvider(key=***)" if self._key else "OpenAICompatProvider(key=none)"
@@ -31,7 +32,7 @@ class OpenAICompatProvider:
     def complete(self, request: ProviderRequest) -> ProviderResponse:
         msgs = [{"role": "system", "content": request.system}, *merge_messages(request.messages)]
         body: dict = {
-            "model": request.model, "messages": msgs, "temperature": request.temperature,
+            "model": self._model_name, "messages": msgs, "temperature": request.temperature,
             "max_completion_tokens": request.max_output_tokens,
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": request.schema_name[:60] or "output", "schema": request.response_schema, "strict": False}},
@@ -70,4 +71,4 @@ class OpenAICompatProvider:
         return ProviderResponse(content=content, tool_calls=tuple(calls), finish_reason=fr,
                                 metrics={"prompt_tokens": tin, "completion_tokens": tout},
                                 usage=ProviderUsage(tin, tout, round((tin * self._pin + tout * self._pout) / 1_000_000, 6)),
-                                model=str(data.get("model") or request.model))
+                                model=str(data.get("model") or self._model_name))

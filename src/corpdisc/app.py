@@ -15,7 +15,7 @@ from corpdisc.agents.broker import ToolBroker
 from corpdisc.agents.dedup import DedupAgent
 from corpdisc.agents.discovery import DiscoveryAgent
 from corpdisc.agents.extraction import ExtractionAgent
-from corpdisc.agents.gateway import CircuitBreaker, GatewayPolicy, LLMGateway
+from corpdisc.agents.gateway import PROVIDER_DEFAULT_LIMITS, CircuitBreaker, GatewayPolicy, LLMGateway, RequestPacer
 from corpdisc.agents.ports import LLMProvider
 from corpdisc.agents.providers import build_provider_from_settings
 from corpdisc.agents.relationship import RelationshipAgent
@@ -56,7 +56,7 @@ from corpdisc.services.robots import PageRepoRobotsStore, RobotsService
 from corpdisc.services.search import SearchService
 from corpdisc.transport import JsonTransport
 
-REAL_PROVIDERS = frozenset({"anthropic", "openai", "ollama"})
+REAL_PROVIDERS = frozenset({"anthropic", "openai", "ollama", "groq", "gemini"})
 
 
 @dataclass
@@ -87,6 +87,29 @@ def uses_real_provider(settings: Settings) -> bool:
     return (settings.llm_provider or "").strip().lower() in REAL_PROVIDERS
 
 
+# Which Settings field holds the model name for each provider (anything else uses LLM_MODEL).
+PROVIDER_MODEL_FIELDS = {"groq": "groq_model", "gemini": "gemini_model"}
+
+
+def provider_settings_for_run(settings: Settings, *, run_provider: str | None, run_model: str | None) -> Settings:
+    """Copy of ``settings`` with the per-run provider/model override applied to the matching model field."""
+    provider = (run_provider or settings.llm_provider or "").strip().lower()
+    update: dict[str, Any] = {"llm_provider": provider}
+    if run_model:
+        update[PROVIDER_MODEL_FIELDS.get(provider, "llm_model")] = run_model
+    return settings.model_copy(update=update)
+
+
+def make_pacer(settings: Settings, provider_name: str, clock: Clock, sleeper: Sleeper) -> RequestPacer | None:
+    """Per-provider client-side pacing: explicit settings win, -1 means the provider default, 0 disables."""
+    d_rpm, d_tpm = PROVIDER_DEFAULT_LIMITS.get((provider_name or "").lower(), (0, 0))
+    rpm = d_rpm if settings.llm_rpm_limit < 0 else settings.llm_rpm_limit
+    tpm = d_tpm if settings.llm_tpm_limit < 0 else settings.llm_tpm_limit
+    if rpm <= 0 and tpm <= 0:
+        return None
+    return RequestPacer(rpm=rpm, tpm=tpm, clock=clock, sleeper=sleeper)
+
+
 def build_runtime(
     settings: Settings,
     *,
@@ -97,8 +120,23 @@ def build_runtime(
     clock: Clock | None = None,
     sleeper: Sleeper | None = None,
     search: SearchService | None = None,
+    run_provider: str | None = None,  # Runtime provider override
+    run_model: str | None = None,  # Runtime model override
 ) -> Runtime:
-    """Wire everything. ``run_id=None`` creates a new run; pass an id to resume one. Never touches the network."""
+    """Wire everything. ``run_id=None`` creates a new run; pass an id to resume one. Never touches the network.
+    
+    Args:
+        settings: Base settings from .env
+        run_id: Run ID (None = create new)
+        http: HTTP client (optional, created if not provided)
+        transport: LLM transport (optional, created if not provided)
+        provider: LLM provider (optional, built from settings if not provided)
+        clock: Clock service (optional, SystemClock if not provided)
+        sleeper: Sleeper service (optional, SystemClock if not provided)
+        search: Search service (optional)
+        run_provider: Override provider for this run (e.g., "groq")
+        run_model: Override model for this run (e.g., "openai/gpt-oss-120b")
+    """
     init_db(settings.db_path)
     conn = connect_writer(settings.db_path)
     sys_clock = SystemClock()
@@ -106,18 +144,27 @@ def build_runtime(
     closers: list[Any] = []
     runs = RunRepo(conn, clock)
     if run_id is None:
-        run_id = init_run(runs, settings)
+        run_id = init_run(runs, settings, run_provider=run_provider, run_model=run_model)
+    
+    # Determine provider/model to use (runtime override takes precedence)
+    effective_provider = (run_provider or settings.llm_provider or "").strip().lower()
+    model_field = PROVIDER_MODEL_FIELDS.get(effective_provider, "llm_model")
+    effective_model = run_model or getattr(settings, model_field) or settings.llm_model or ""
+    
     if provider is None:
-        name = (settings.llm_provider or "").strip().lower()
-        if name in REAL_PROVIDERS:
-            if not settings.llm_model.strip():
+        name = effective_provider
+        if name in REAL_PROVIDERS or name == "gemini":
+            if not effective_model.strip():
                 conn.close()
                 raise ValueError(f"LLM_MODEL is required for provider '{name}'")
             if transport is None:
                 transport = RequestsJsonTransport()
                 closers.append(transport)
-        provider = build_provider_from_settings(settings, transport=transport)
-    model = settings.llm_model.strip() or "unspecified"
+        provider_settings = provider_settings_for_run(settings, run_provider=run_provider, run_model=run_model)
+        provider = build_provider_from_settings(provider_settings, transport=transport)
+    
+    # Use effective model
+    model = effective_model.strip() if effective_model else "unspecified"
 
     cfg = FetchConfig.from_settings(settings)
     pages = PageRepo(conn, clock)
@@ -137,7 +184,8 @@ def build_runtime(
         closers.append(fetch)
 
     gateway = LLMGateway(provider, model=model, policy=GatewayPolicy.from_settings(settings),
-                         breaker=CircuitBreaker(settings.llm_breaker_threshold), budget=budget, clock=clock, sleeper=sleeper)
+                         breaker=CircuitBreaker(settings.llm_breaker_threshold), budget=budget, clock=clock, sleeper=sleeper,
+                         pacer=make_pacer(settings, effective_provider or getattr(provider, "name", ""), clock, sleeper))
     audit = SqliteAuditSink(conn)
     broker = ToolBroker([make_page_excerpt_spec(pages, cache, run_id)], audit=audit, clock=clock, budget=budget)
     runner = AgentRunner(gateway=gateway, audit=audit, cache=SqliteResponseCache(conn), budget=budget, broker=broker,

@@ -94,6 +94,11 @@ class Settings(BaseSettings):
     llm_transport_retries: int = Field(default=3, ge=0)
     llm_backoff_base_seconds: float = Field(default=1.0, ge=0)
     llm_backoff_max_seconds: float = Field(default=30.0, ge=0)
+    # Rate limits (HTTP 429): client-side pacing, Retry-After handling. -1 = provider default (groq: 30 RPM), 0 = off.
+    llm_rpm_limit: int = Field(default=-1, ge=-1)
+    llm_tpm_limit: int = Field(default=-1, ge=-1)
+    llm_rate_limit_retries: int = Field(default=5, ge=0)  # 429 retries inside one call (do not use the 5xx retry count)
+    llm_retry_after_ceiling_seconds: float = Field(default=120.0, ge=0)  # longer Retry-After => defer the task instead
     llm_temperature: float = Field(default=0.0, ge=0, le=2)
     llm_cassette_dir: Path = Path("./.cache/llm_cassettes")
     # M8 real providers
@@ -119,6 +124,15 @@ class Settings(BaseSettings):
     llm_provider: str = ""
     llm_model: str = ""
     llm_api_key: SecretStr | None = None
+    # Gemini-specific configuration
+    gemini_model: str = ""
+    gemini_api_key: SecretStr | None = None
+    # Groq-specific configuration
+    groq_model: str = ""
+    groq_api_key: SecretStr | None = None
+    # Runtime provider/model selection (CLI override)
+    run_provider: str | None = None
+    run_model: str | None = None
     search_provider: str = ""
     search_api_key: SecretStr | None = None
 
@@ -221,7 +235,7 @@ class Settings(BaseSettings):
 
     def secret_values(self) -> list[str]:
         """Non-empty secret values, for the logging redactor. Never print the result."""
-        secrets = (self.llm_api_key, self.search_api_key)
+        secrets = (self.llm_api_key, self.gemini_api_key, self.groq_api_key)
         return [s.get_secret_value() for s in secrets if s is not None and s.get_secret_value()]
 
 

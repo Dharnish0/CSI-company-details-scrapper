@@ -8,8 +8,10 @@ CRUD layer in M0; this module only opens, initializes and verifies the database.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 
@@ -134,6 +136,67 @@ def verify_db(db_path: str | Path) -> InitReport:
     return InitReport(str(db_path), tables, fk, mode)
 
 
+RUN_COLUMNS = (
+    "run_id", "root_name", "root_url", "root_code", "config_json", "status",
+    "started_at", "finished_at", "llm_token_budget", "llm_tokens_used", "llm_cost_usd",
+)
+_RUNS_DDL = re.compile(r"CREATE TABLE IF NOT EXISTS runs \(.*?\n\);", re.DOTALL)
+
+
+def _backup_before_migration(db_path: str | Path) -> Path:
+    src = Path(db_path)
+    backups = src.resolve().parent / "backups"
+    backups.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    dest = backups / f"{src.stem}-{stamp}-premigrate{src.suffix}"
+    src_conn = sqlite3.connect(str(src))
+    try:
+        dest_conn = sqlite3.connect(str(dest))
+        try:
+            src_conn.backup(dest_conn)  # consistent copy, includes WAL content
+        finally:
+            dest_conn.close()
+    finally:
+        src_conn.close()
+    return dest
+
+
+def migrate_db(conn: sqlite3.Connection, db_path: str | Path) -> Path | None:
+    """Upgrade an existing database in place. Returns the backup path if a migration ran.
+
+    Currently: widen the ``runs.status`` CHECK to include 'PARTIAL' (SQLite cannot alter a
+    CHECK, so the table is rebuilt; rows are copied unchanged). A file backup is taken first.
+    """
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='runs'").fetchone()
+    if row is None or "'PARTIAL'" in (row[0] or ""):
+        return None
+    match = _RUNS_DDL.search(load_schema_sql())
+    if match is None:
+        raise DatabaseError("cannot locate runs DDL in schema.sql for migration")
+    backup = None if _is_memory(db_path) else _backup_before_migration(db_path)
+    ddl = match.group(0).replace("CREATE TABLE IF NOT EXISTS runs ", "CREATE TABLE runs_new ", 1)
+    cols = ", ".join(RUN_COLUMNS)
+    try:
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys=OFF;")
+        conn.execute("BEGIN")
+        conn.execute("DROP TABLE IF EXISTS runs_new")
+        conn.execute(ddl)
+        conn.execute(f"INSERT INTO runs_new ({cols}) SELECT {cols} FROM runs")
+        conn.execute("DROP TABLE runs")
+        conn.execute("ALTER TABLE runs_new RENAME TO runs")
+        violations = conn.execute("PRAGMA foreign_key_check;").fetchall()
+        if violations:
+            raise DatabaseError(f"migration produced {len(violations)} foreign key violation(s)")
+        conn.execute("COMMIT")
+    except (sqlite3.Error, DatabaseError):
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON;")
+    return backup
+
 def init_db(db_path: str | Path) -> InitReport:
     """Create all tables from schema.sql (idempotent), then verify the database."""
     if _is_memory(db_path):
@@ -141,6 +204,7 @@ def init_db(db_path: str | Path) -> InitReport:
     conn = connect_writer(db_path)
     try:
         conn.executescript(load_schema_sql())
+        migrate_db(conn, db_path)
     except sqlite3.Error as exc:
         raise DatabaseError(f"schema initialization failed for {db_path}: {exc}") from exc
     finally:

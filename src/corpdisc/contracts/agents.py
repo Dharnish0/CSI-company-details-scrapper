@@ -93,6 +93,8 @@ class Usage(Strict):
 class AgentError(Strict):
     kind: FailureKind
     message: str = Field(max_length=500)
+    retryable: bool = False  # transient transport failure: the caller may reschedule the work
+    retry_after_s: float | None = None  # server-requested delay (e.g. HTTP 429 Retry-After)
 
 
 In = TypeVar("In", bound=BaseModel)

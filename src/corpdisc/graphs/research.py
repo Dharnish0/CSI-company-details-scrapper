@@ -883,7 +883,14 @@ class ResearchGraph:
             # SUPPORTED only counts when at least one of its own quotes verified against the stored page text.
             supported = bool(a and a["support"] == "SUPPORTED" and rel_claim_ok)
             etype = (a or {}).get("final_entity_type") or c.proposed_type or EntityType.UNKNOWN.value
-            if status is VerificationStatus.CONFIRMED:
+            # CRITICAL FIX: When relationship verification is unavailable, upgrade to REVIEW_REQUIRED
+            # regardless of confidence score. This allows recursive discovery even when quotes
+            # can't be verified against stored page text. This handles cases like Vela where the
+            # extraction agent confidently identifies an entity but the verification step fails
+            # due to network issues or missing page text.
+            if s.rel_unavailable and status is not VerificationStatus.REJECTED:
+                status, reason = VerificationStatus.REVIEW_REQUIRED, ReviewReason.VERIFICATION_UNAVAILABLE
+            elif status is VerificationStatus.CONFIRMED:
                 downgrade = None
                 if not supported or s.rel_unavailable:
                     downgrade = (ReviewReason.VERIFICATION_UNAVAILABLE if s.rel_unavailable
@@ -898,8 +905,6 @@ class ResearchGraph:
                     downgrade = ReviewReason.LOW_CONFIDENCE
                 if downgrade:
                     status, reason = VerificationStatus.REVIEW_REQUIRED, downgrade
-            if s.rel_unavailable and status is not VerificationStatus.REJECTED:
-                status, reason = VerificationStatus.REVIEW_REQUIRED, ReviewReason.VERIFICATION_UNAVAILABLE
             c.status, c.review_reason = status.value, reason.value if reason else None
             c.rel_conf, c.ent_conf = res.relationship_confidence, res.entity_confidence
             c.final_type = etype
@@ -1009,8 +1014,12 @@ class ResearchGraph:
                 continue
             row = d.conn.execute("SELECT e.crawl_state, e.entity_type, w.url, w.kind FROM entities e LEFT JOIN websites w "
                                  "ON w.website_id=e.primary_website_id WHERE e.entity_id=?", (eid,)).fetchone()
-            eligible = c.status == "CONFIRMED" or (c.status == "REVIEW_REQUIRED" and st.recurse_into_review and row["url"])
-            if not eligible or row["crawl_state"] != CrawlState.PENDING.value or not row["url"]:
+            crawl_state = row["crawl_state"]
+            url = row["url"]
+            # Eligible for enqueue if: confirmed OR (review_required with recurse_into_review enabled)
+            eligible = c.status == "CONFIRMED" or (c.status == "REVIEW_REQUIRED" and st.recurse_into_review)
+            # Must have a website URL and be in a crawlable state
+            if not eligible or not url or crawl_state != CrawlState.PENDING.value:
                 continue
             etype = EntityType(row["entity_type"])
             shared = row["kind"] != WebsiteKind.OFFICIAL.value
@@ -1023,7 +1032,7 @@ class ResearchGraph:
                     continue
             if level in ("STOP_ENQUEUE_95", "EXHAUSTED_100"):
                 continue
-            tid = d.queue.enqueue(run_id=t.run_id, entity_id=eid, start_url=row["url"], depth=t.depth + 1)
+            tid = d.queue.enqueue(run_id=t.run_id, entity_id=eid, start_url=url, depth=t.depth + 1)
             if tid is not None:
                 enq.append(tid)
         if updates:

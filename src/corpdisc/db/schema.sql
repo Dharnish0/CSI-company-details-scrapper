@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS runs (
   root_code     TEXT NOT NULL,          -- e.g. CSI, used as Tree ID prefix
   config_json   TEXT NOT NULL,
   status        TEXT NOT NULL CHECK (status IN (
-      'RUNNING','PAUSED','BUDGET_EXHAUSTED','COMPLETED','FAILED','CANCELLED')),
+      'RUNNING','PAUSED','BUDGET_EXHAUSTED','COMPLETED','PARTIAL','FAILED','CANCELLED')),
   started_at    TEXT NOT NULL,
   finished_at   TEXT,
   llm_token_budget INTEGER,

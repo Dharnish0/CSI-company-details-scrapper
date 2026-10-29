@@ -91,9 +91,11 @@ class AgentRunner:
             finished_at=self._clock.now()))
 
     @staticmethod
-    def _fail(meta: Meta, status: CallStatus, kind: FailureKind, msg: str, usage: Usage) -> AgentResponse:
+    def _fail(meta: Meta, status: CallStatus, kind: FailureKind, msg: str, usage: Usage, *, retryable: bool = False,
+              retry_after_s: float | None = None) -> AgentResponse:
         return AgentResponse(meta=meta, status=status, payload=None, usage=usage,
-                             error=AgentError(kind=kind, message=msg[:500]))
+                             error=AgentError(kind=kind, message=msg[:500], retryable=retryable,
+                                              retry_after_s=retry_after_s))
 
     # ------------------------------------------------------------------ invoke
     def invoke(self, agent: BaseAgent, request: AgentRequest, *, feedback: str | None = None) -> AgentResponse:
@@ -187,10 +189,13 @@ class AgentRunner:
             attempt += 1
             meta = m.model_copy(update={"attempt": attempt})
             inv = self._start(request, attempt, cache_key, request_json(kind, messages))
+            # Tools are offered only while the agent may still call them. After the tool budget is spent, and on every REPAIR
+            # turn, the request is tool-free so providers can enforce the structured-output schema on the final answer.
+            turn_tools = tools if (kind != 'REPAIR' and tool_calls < agent.max_tool_calls) else ()
             preq = ProviderRequest(model=model, system=system, messages=tuple(messages),
                                    response_schema=agent.output_model.model_json_schema(),
                                    schema_name=agent.output_model.__name__, temperature=self._gw.policy.temperature,
-                                   max_output_tokens=max_out, tools=tools, reasoning=self._reasoning.get(agent.name),
+                                   max_output_tokens=max_out, tools=turn_tools, reasoning=self._reasoning.get(agent.name),
                                    metadata={"correlation_id": m.correlation_id, "agent": agent.name.value})
             res = self._gw.complete(preq, max_requests=self._limits.max_provider_requests - used)
             used += res.requests_used
@@ -204,7 +209,9 @@ class AgentRunner:
                 log.info("agent=%s corr=%s invocation=%s attempt=%s status=FAILED kind=%s", agent.name,
                          m.correlation_id, inv, attempt, fk)
                 return self._fail(meta, CallStatus.FAILED, fk, res.failure.message if res.failure else "no response",
-                                  Usage(tokens_in=t_in, tokens_out=t_out, cost_usd=cost, latency_ms=latency))
+                                  Usage(tokens_in=t_in, tokens_out=t_out, cost_usd=cost, latency_ms=latency),
+                                  retryable=bool(res.failure and res.failure.retryable),
+                                  retry_after_s=res.failure.retry_after_s if res.failure else None)
             r = res.response
             diag = {"finish_reason": r.finish_reason, "provider_metrics": dict(r.metrics)}
             t_in, t_out, cost = t_in + r.usage.tokens_in, t_out + r.usage.tokens_out, cost + r.usage.cost_usd

@@ -29,7 +29,49 @@ def retry_after(headers: Mapping[str, str]) -> float | None:
     try:
         return max(0.0, float(v)) if v is not None else None
     except ValueError:
+        return _to_seconds(v)
+
+
+def compact_schema(schema: Any) -> Any:
+    """Drop noise keys (title/default/additionalProperties) from a JSON Schema to keep prompts short."""
+    if isinstance(schema, dict):
+        return {k: compact_schema(v) for k, v in schema.items() if k not in ("title", "default", "additionalProperties")}
+    if isinstance(schema, list):
+        return [compact_schema(v) for v in schema]
+    return schema
+
+
+def _to_seconds(value: str | None) -> float | None:
+    """Parse '2m59.56s', '7.66s', '120ms', '30' (Groq/OpenAI style durations) into seconds."""
+    if not value:
         return None
+    m = re.fullmatch(r"\s*(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m(?!s))?(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?\s*", value)
+    if m and any(m.groups()):
+        h, mi, s, ms = (float(g) if g else 0.0 for g in m.groups())
+        return h * 3600 + mi * 60 + s + ms / 1000
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def ratelimit_metrics(headers: Mapping[str, str]) -> dict[str, Any]:
+    """Extract x-ratelimit-* hints (remaining requests/tokens and reset delays) from response headers."""
+    out: dict[str, Any] = {}
+    for key, name in (("x-ratelimit-remaining-requests", "rl_remaining_requests"),
+                      ("x-ratelimit-remaining-tokens", "rl_remaining_tokens"),
+                      ("x-ratelimit-limit-requests", "rl_limit_requests"),
+                      ("x-ratelimit-limit-tokens", "rl_limit_tokens")):
+        try:
+            if headers.get(key) is not None:
+                out[name] = int(float(headers[key]))
+        except ValueError:
+            pass
+    for key, name in (("x-ratelimit-reset-requests", "rl_reset_requests_s"), ("x-ratelimit-reset-tokens", "rl_reset_tokens_s")):
+        v = _to_seconds(headers.get(key))
+        if v is not None:
+            out[name] = v
+    return out
 
 
 def strip_fences(text: str) -> str:
@@ -59,7 +101,8 @@ def classify(reply: HttpReply, *, provider: str, secret: str | None) -> Provider
     if s in (401, 402, 403):  # bad key, no credit or quota, forbidden: never retried, opens the breaker
         return ProviderAuthError(f"{provider} auth/quota error {s}: {detail}")
     if s == 429 or s == 408 or s >= 500 or s == 529:
-        return ProviderTransportError(f"{provider} transient error {s}", retryable=True, retry_after_s=retry_after(reply.headers))
+        return ProviderTransportError(f"{provider} transient error {s}", retryable=True, retry_after_s=retry_after(reply.headers),
+                                       rate_limited=s == 429)
     return ProviderTransportError(f"{provider} rejected the request ({s}): {detail}", retryable=False)
 
 

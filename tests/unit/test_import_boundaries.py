@@ -44,8 +44,10 @@ def check_source(module: str, source: str) -> list[str]:
     bad: list[str] = []
     for name in _imports(tree):
         root = name.split(".")[0]
+        # LLM SDK imports are allowed only in providers/
         if any(name == s or name.startswith(s + ".") for s in SDKS):
-            bad.append(f"{module}: LLM SDK import {name}")
+            if not in_providers:
+                bad.append(f"{module}: LLM SDK import {name}")
         if root == "langgraph" and top != "graphs":
             bad.append(f"{module}: langgraph outside graphs/")
         if root == "corpdisc":

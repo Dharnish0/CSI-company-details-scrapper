@@ -6,15 +6,18 @@ from pathlib import Path
 
 from corpdisc.agents.ports import LLMProvider, ProviderAuthError, ProviderNotImplementedError
 from corpdisc.agents.providers.anthropic import AnthropicProvider
+from corpdisc.agents.providers.gemini import GeminiProvider
+from corpdisc.agents.providers.groq import GroqProvider
 from corpdisc.agents.providers.ollama import OllamaProvider
+from corpdisc.agents.providers.openai import OpenAIProvider
 from corpdisc.agents.providers.openai_compat import OpenAICompatProvider
 from corpdisc.config import Settings
 from corpdisc.transport import JsonTransport
 from corpdisc.agents.providers.cassette import RecordingProvider, ReplayProvider
 from corpdisc.agents.providers.fake import FakeLLMProvider
 
-REAL_PROVIDERS = frozenset({"openai", "anthropic", "ollama"})
-UNIMPLEMENTED_PROVIDERS = frozenset({"gemini", "google"})
+REAL_PROVIDERS = frozenset({"openai", "anthropic", "ollama", "gemini", "groq"})
+UNIMPLEMENTED_PROVIDERS = frozenset({})
 
 
 def build_provider(name: str, *, cassette_path: Path | None = None, inner: LLMProvider | None = None) -> LLMProvider:
@@ -61,6 +64,46 @@ def build_provider_from_settings(settings: Settings, *, transport: JsonTransport
             raise ValueError("a transport is required for a real provider")
         inner = OllamaProvider(transport=transport, base_url=settings.llm_base_url, timeout=settings.llm_timeout_seconds,
                                num_ctx=settings.ollama_num_ctx, keep_alive=settings.ollama_keep_alive)
+    elif name == "gemini":
+        if settings.gemini_api_key is None:
+            raise ValueError("GEMINI_API_KEY is required for provider 'gemini'")
+        if transport is None:
+            raise ValueError("a transport is required for a real provider")
+        inner = GeminiProvider(
+            api_key=settings.gemini_api_key.get_secret_value(),
+            transport=transport,
+            base_url=settings.llm_base_url or "",
+            timeout=settings.llm_timeout_seconds,
+            price_in_per_mtok=settings.llm_price_in_per_mtok,
+            price_out_per_mtok=settings.llm_price_out_per_mtok,
+            model_name=settings.gemini_model or "gemini-1.5-flash",
+        )
+    elif name == "openai":
+        if settings.llm_api_key is None:
+            raise ValueError("LLM_API_KEY is required for provider 'openai'")
+        if transport is None:
+            raise ValueError("a transport is required for a real provider")
+        inner = OpenAIProvider(
+            api_key=settings.llm_api_key.get_secret_value(),
+            transport=transport,
+            base_url=settings.llm_base_url or "",
+            timeout=settings.llm_timeout_seconds,
+            model_name=settings.llm_model or "gpt-4.1-mini",
+        )
+    elif name == "groq":
+        if settings.groq_api_key is None:
+            raise ValueError("GROQ_API_KEY is required for provider 'groq'")
+        if transport is None:
+            raise ValueError("a transport is required for a real provider")
+        inner = GroqProvider(
+            api_key=settings.groq_api_key.get_secret_value(),
+            transport=transport,
+            base_url=settings.llm_base_url or "",
+            timeout=settings.llm_timeout_seconds,
+            price_in_per_mtok=settings.llm_price_in_per_mtok,
+            price_out_per_mtok=settings.llm_price_out_per_mtok,
+            model_name=settings.groq_model or "llama-3.3-70b-versatile",
+        )
     elif name in REAL_PROVIDERS:
         if settings.llm_api_key is None:
             raise ValueError(f"LLM_API_KEY is required for provider '{name}'")
@@ -79,5 +122,5 @@ def build_provider_from_settings(settings: Settings, *, transport: JsonTransport
     return inner
 
 
-__all__ = ["OllamaProvider", "AnthropicProvider", "FakeLLMProvider", "OpenAICompatProvider", "RecordingProvider", "ReplayProvider",
+__all__ = ["OllamaProvider", "AnthropicProvider", "GeminiProvider", "GroqProvider", "FakeLLMProvider", "OpenAIProvider", "OpenAICompatProvider", "RecordingProvider", "ReplayProvider",
            "UnconfiguredProvider", "build_provider", "build_provider_from_settings"]

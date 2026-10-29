@@ -185,7 +185,7 @@ def test_retry_after_is_honoured_then_success_and_usage_is_recorded(tmp_path):
     assert r.status is CallStatus.OK and len(t.calls) == 2 and s.clock.sleeps == [3.0]
     row = s.conn.execute("SELECT llm_tokens_used, llm_cost_usd FROM runs").fetchone()
     assert row[0] == 150 and row[1] == pytest.approx(0.15)
-    assert json.loads(s.rows()[0]["response_json"])["transport"] == {"requests": 2, "errors": ["ProviderTransportError"]}
+    assert json.loads(s.rows()[0]["response_json"])["transport"] == {"requests": 1, "errors": ["RATE_LIMITED"]}  # a 429 consumed no model work
 
 
 def test_auth_failure_opens_the_breaker_and_stops_all_provider_traffic(tmp_path):
@@ -254,7 +254,8 @@ def test_factory_from_settings(tmp_path):
         build_provider_from_settings(Settings(**base, llm_provider="anthropic"), transport=FakeTransport())
     with pytest.raises(ValueError, match="transport"):
         build_provider_from_settings(Settings(**base, llm_provider="openai", llm_api_key=KEY))
-    with pytest.raises(ProviderNotImplementedError):
+    # Gemini is now implemented and requires GEMINI_API_KEY
+    with pytest.raises(ValueError, match="GEMINI_API_KEY"):
         build_provider_from_settings(Settings(**base, llm_provider="gemini"))
     with pytest.raises(ValueError, match="unknown"):
         build_provider_from_settings(Settings(**base, llm_provider="mystery"))

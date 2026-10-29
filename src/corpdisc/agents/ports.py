@@ -22,10 +22,12 @@ __all__ = [
 
 
 class ProviderError(Exception):
-    def __init__(self, message: str, *, retryable: bool = False, retry_after_s: float | None = None) -> None:
+    def __init__(self, message: str, *, retryable: bool = False, retry_after_s: float | None = None,
+                 rate_limited: bool = False) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.retry_after_s = retry_after_s
+        self.rate_limited = rate_limited  # HTTP 429: the request was refused before any model work
 
 
 class ProviderTransportError(ProviderError):

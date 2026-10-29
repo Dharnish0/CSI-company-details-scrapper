@@ -146,10 +146,9 @@ def test_record_then_replay_round_trip_and_replay_miss_fails_closed(tmp_path):
 
 def test_provider_factory_policy(tmp_path):
     assert build_provider("fake").name == "fake"
-    for name in ("gemini", "google"):  # no adapter exists
-        with pytest.raises(ProviderNotImplementedError):
-            build_provider(name)
-    for name in ("openai", "anthropic"):  # real adapters exist but only via configuration (credentials + transport)
+    with pytest.raises(ValueError, match="unknown provider"):  # no adapter exists under this name
+        build_provider("google")
+    for name in ("openai", "anthropic", "gemini", "groq", "ollama"):  # real adapters exist but only via configuration (credentials + transport)
         with pytest.raises(ValueError, match="build_provider_from_settings"):
             build_provider(name)
     with pytest.raises(ValueError):

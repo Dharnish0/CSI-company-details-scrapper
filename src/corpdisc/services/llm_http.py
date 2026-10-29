@@ -38,7 +38,12 @@ class RequestsJsonTransport:
         except requests.Timeout as exc:
             raise TransportFailure("TIMEOUT", "request timed out") from exc
         except requests.exceptions.SSLError as exc:
-            raise TransportFailure("SSL", "TLS failure") from exc
+            # Include the original error details for diagnosis (safe - no secrets in SSLError)
+            msg = f"TLS failure: {type(exc).__name__}"
+            if exc.args:
+                msg += f" - {exc.args[0]}"
+            log.warning("LLM transport SSL error: %s", msg)
+            raise TransportFailure("SSL", msg) from exc
         except requests.RequestException as exc:
             log.warning("LLM transport error: %s", type(exc).__name__)
             raise TransportFailure("CONNECTION", type(exc).__name__) from exc

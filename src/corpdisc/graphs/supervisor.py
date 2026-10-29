@@ -43,9 +43,21 @@ class RunSummary:
     finalize: FinalizeResult | None = None
 
 
-def init_run(repo: RunRepo, settings: Settings) -> int:
-    """Create the ``runs`` row from settings (retargeting = changing START_URL / ROOT_COMPANY / ROOT_CODE)."""
+def init_run(repo: RunRepo, settings: Settings, *, run_provider: str | None = None, run_model: str | None = None) -> int:
+    """Create the ``runs`` row from settings (retargeting = changing START_URL / ROOT_COMPANY / ROOT_CODE).
+    
+    Args:
+        repo: Run repository
+        settings: Base settings from .env
+        run_provider: Override provider for this run (stored in config_json)
+        run_model: Override model for this run (stored in config_json)
+    """
     cfg = {k: v for k, v in settings.model_dump(mode="json").items() if "key" not in k}
+    # Add runtime provider/model to config_json for persistence
+    if run_provider:
+        cfg["llm_provider"] = run_provider
+    if run_model:
+        cfg["llm_model"] = run_model
     return repo.create_run(root_name=settings.root_company, root_url=settings.start_url, root_code=settings.root_code,
                            config_json=json.dumps(cfg, sort_keys=True, default=str),
                            llm_token_budget=settings.llm_token_budget)

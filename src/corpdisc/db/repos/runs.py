@@ -38,3 +38,10 @@ class RunRepo:
         if row is None:
             raise LookupError(f"unknown run {run_id}")
         return RunStatus(row[0])
+
+    def get_latest_run_id(self) -> int | None:
+        row = self._conn.execute("SELECT run_id FROM runs ORDER BY run_id DESC LIMIT 1").fetchone()
+        return None if row is None else int(row[0])
+
+    def get_run(self, run_id: int) -> tuple | None:
+        return self._conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()

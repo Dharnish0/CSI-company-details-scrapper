@@ -330,3 +330,79 @@ def test_enum_values_match_schema_checks(conn, world):
             insert_value("BOGUS_VALUE")  # DB rejects a bogus value
         with pytest.raises(ValueError):
             enum_cls("BOGUS_VALUE")  # model layer rejects it as well
+
+
+# ---- schema reconstruction / migration (Phase 1) ----
+def test_fresh_init_matches_live_db_columns(tmp_path):
+    import shutil
+
+    from corpdisc.db.connection import init_db as _init
+
+    fresh = tmp_path / "fresh.db"
+    report = _init(fresh)
+    assert report.table_count >= len(EXPECTED_TABLES)
+    assert set(EXPECTED_TABLES) <= set(report.tables)
+    live = Path(__file__).resolve().parents[1] / "data" / "csi_hierarchy.db"
+    if not live.is_file():
+        pytest.skip("live DB not present")
+    copy = tmp_path / "live_copy.db"
+    shutil.copy(live, copy)
+
+    def cols(path):
+        c = sqlite3.connect(str(path))
+        try:
+            return {
+                t: [tuple(r[1:6]) for r in c.execute(f"PRAGMA table_info({t})")]
+                for t in EXPECTED_TABLES
+            }
+        finally:
+            c.close()
+
+    assert cols(fresh) == cols(copy)
+
+
+def test_init_db_is_idempotent_and_accepts_partial(tmp_path):
+    path = tmp_path / "x.db"
+    init_db(path)
+    init_db(path)
+    c = connect_writer(path)
+    c.execute(
+        "INSERT INTO runs (root_name, root_url, root_code, config_json, status, started_at) "
+        "VALUES ('a','https://a.example','A','{}','PARTIAL',?)",
+        (NOW,),
+    )
+    c.commit()
+    c.close()
+
+
+def test_migration_widens_runs_check_preserving_rows(tmp_path):
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(str(path))
+    old.executescript(
+        """CREATE TABLE runs (
+          run_id INTEGER PRIMARY KEY, root_name TEXT NOT NULL, root_url TEXT NOT NULL,
+          root_code TEXT NOT NULL, config_json TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN (
+            'RUNNING','PAUSED','BUDGET_EXHAUSTED','COMPLETED','FAILED','CANCELLED')),
+          started_at TEXT NOT NULL, finished_at TEXT, llm_token_budget INTEGER,
+          llm_tokens_used INTEGER NOT NULL DEFAULT 0, llm_cost_usd REAL NOT NULL DEFAULT 0);
+        INSERT INTO runs (run_id, root_name, root_url, root_code, config_json, status, started_at, llm_tokens_used)
+        VALUES (7,'Old','https://old.example','OLD','{}','COMPLETED','2026-01-01T00:00:00+00:00',123);"""
+    )
+    old.commit()
+    old.close()
+    init_db(path)
+    backups = list((tmp_path / "backups").glob("old-*-premigrate.db"))
+    assert len(backups) == 1
+    c = connect_writer(path)
+    row = c.execute("SELECT run_id, root_name, llm_tokens_used FROM runs").fetchall()
+    assert [tuple(r) for r in row] == [(7, "Old", 123)]
+    c.execute(
+        "INSERT INTO runs (root_name, root_url, root_code, config_json, status, started_at) "
+        "VALUES ('b','https://b.example','B','{}','PARTIAL',?)",
+        (NOW,),
+    )
+    c.commit()
+    c.close()
+    init_db(path)  # second run is a no-op
+    assert len(list((tmp_path / "backups").glob("old-*-premigrate.db"))) == 1
