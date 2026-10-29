@@ -32,7 +32,7 @@ def test_help_in_process(capsys: pytest.CaptureFixture[str]):
     for command in ("init-db", "run", "resume", "report", "export", "verify"):
         assert f"\n    {command}" in out, command
     for forbidden in ("crawl", "llm"):
-        assert f"\n    {forbidden}" not in out
+        assert f"\n    {forbidden} " not in out  # (`llms` lists models and is a real command; a bare `llm` is not)
 
 
 def test_no_command_prints_help(capsys: pytest.CaptureFixture[str]):

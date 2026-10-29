@@ -77,6 +77,7 @@ def build_provider_from_settings(settings: Settings, *, transport: JsonTransport
             price_in_per_mtok=settings.llm_price_in_per_mtok,
             price_out_per_mtok=settings.llm_price_out_per_mtok,
             model_name=settings.gemini_model or "gemini-1.5-flash",
+            thinking=settings.gemini_thinking,
         )
     elif name == "openai":
         if settings.llm_api_key is None:

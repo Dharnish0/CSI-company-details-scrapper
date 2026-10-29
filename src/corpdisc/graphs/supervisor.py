@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 
 from corpdisc.clock import Clock, Sleeper
-from corpdisc.config import Settings
+from corpdisc.config import PROVIDER_MODEL_FIELDS, Settings
 from corpdisc.contracts.postgate import CommitPlan, CommitRejected, EntityWrite, TaskWrite, WebsiteWrite, EntityRef
 from corpdisc.db.repos.runs import RunRepo
 from corpdisc.graphs.deps import ResearchDeps
@@ -66,10 +66,9 @@ def init_run(repo: RunRepo, settings: Settings, *, run_provider: str | None = No
     """
     cfg = {k: v for k, v in settings.model_dump(mode="json").items() if "key" not in k}
     # Add runtime provider/model to config_json for persistence
-    if run_provider:
-        cfg["llm_provider"] = run_provider
-    if run_model:
-        cfg["llm_model"] = run_model
+    provider = (run_provider or settings.llm_provider or "").strip().lower()
+    cfg["llm_provider"] = provider
+    cfg["llm_model"] = run_model or getattr(settings, PROVIDER_MODEL_FIELDS.get(provider, "llm_model")) or ""
     return repo.create_run(root_name=settings.root_company, root_url=settings.start_url, root_code=settings.root_code,
                            config_json=json.dumps(cfg, sort_keys=True, default=str),
                            llm_token_budget=settings.llm_token_budget)

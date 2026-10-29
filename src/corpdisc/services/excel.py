@@ -17,6 +17,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from corpdisc.models.domain import run_status_label
 from corpdisc.services.calibration import build_report
 
 HIERARCHY_COLS = ["Entity ID", "Tree ID", "Company Name", "Entity Type", "Parent Entity", "Parent ID", "Relationship", "Level",
@@ -132,7 +133,9 @@ def export_workbook(conn: sqlite3.Connection, run_id: int, path: str | Path) -> 
     per_level = Counter(e["level"] for e in tree)
     errors = sum(rep["errors"].values())
     summary: list[list[Any]] = [
-        ["Run ID", run_id], ["Run status", run["status"]], ["Budget limited", "YES" if run["status"] == "BUDGET_EXHAUSTED" else "no"],
+        ["Run ID", run_id], ["Run status", run_status_label(run["status"])], ["Budget limited", "YES" if run["status"] == "BUDGET_EXHAUSTED" else "no"],
+        ["Failed tasks", q("SELECT COUNT(*) FROM research_queue WHERE run_id=? AND status='FAILED'", run_id)[0][0]],
+        ["Tasks finished with gaps (partial)", q("SELECT COUNT(*) FROM research_queue WHERE run_id=? AND status='DONE' AND error LIKE 'PARTIAL:%'", run_id)[0][0]],
         ["Root company", run["root_name"]], ["Total confirmed (incl. root)", len(tree)], ["Deepest level", max(per_level) if per_level else 0],
         *[[f"Confirmed at level {lv}", per_level[lv]] for lv in sorted(per_level)],
         *[[f"Companies under group: {g[0]}", g[4]] for g in groups],

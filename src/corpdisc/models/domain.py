@@ -142,6 +142,11 @@ class RunStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+def run_status_label(status: str) -> str:
+    """Display name of a stored run status: BUDGET_EXHAUSTED is shown as BUDGET_STOPPED (stored value kept for compatibility)."""
+    return "BUDGET_STOPPED" if str(status) == RunStatus.BUDGET_EXHAUSTED.value else str(status)
+
+
 class WebsiteKind(StrEnum):
     OFFICIAL = "OFFICIAL"
     SECTION_OF_PARENT = "SECTION_OF_PARENT"

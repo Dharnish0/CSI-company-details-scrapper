@@ -6,8 +6,11 @@ It never reads page text or prompts and contains no secrets.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any
+
+from corpdisc.models.domain import run_status_label
 
 _PROVIDER_CALL = ("cache_hit = 0 AND status <> 'SKIPPED' AND (failure_kind IS NULL OR failure_kind NOT IN ('BUDGET','CIRCUIT_OPEN'))")
 
@@ -38,6 +41,8 @@ def build_report(conn: sqlite3.Connection, run_id: int) -> dict[str, Any]:
         SUM(CASE WHEN failure_kind='SCHEMA' THEN 1 ELSE 0 END) schema_failures,
         SUM(CASE WHEN failure_kind='TRANSPORT' THEN 1 ELSE 0 END) transport_failures,
         SUM(CASE WHEN status='SKIPPED' THEN 1 ELSE 0 END) skipped,
+        SUM(CASE WHEN status='OK' AND cache_hit=0 THEN 1 ELSE 0 END) ok_n,
+        SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) failed_n, COUNT(*) attempts,
         COALESCE(SUM(tokens_in),0) tin, COALESCE(SUM(tokens_out),0) tout, COALESCE(SUM(cost_usd),0) cost,
         AVG(latency_ms) latency FROM agent_invocations WHERE run_id=? GROUP BY agent""", run_id):
         calls, hits = int(r["calls"]), int(r["hits"])
@@ -45,9 +50,25 @@ def build_report(conn: sqlite3.Connection, run_id: int) -> dict[str, Any]:
         per_agent[r["agent"]] = {
             "provider_calls": calls, "cache_hits": hits, "schema_failures": int(r["schema_failures"]),
             "transport_failures": int(r["transport_failures"]), "skipped_by_budget_or_circuit": int(r["skipped"]),
+            "attempts": int(r["attempts"]), "ok": int(r["ok_n"]), "failed": int(r["failed_n"]),
+            # failure rate over invocations that reached a provider outcome (cache hits and budget skips excluded)
+            "failure_rate": round(int(r["failed_n"]) / (int(r["ok_n"]) + int(r["failed_n"])), 4) if (int(r["ok_n"]) + int(r["failed_n"])) else None,
+            "failure_kinds": {},
             "tokens_in": int(r["tin"]), "tokens_out": int(r["tout"]), "cost_usd": round(float(r["cost"]), 6),
             "avg_latency_ms": None if r["latency"] is None else round(float(r["latency"]), 1)}
+    for r in _rows(conn, "SELECT agent, failure_kind, COUNT(*) n FROM agent_invocations WHERE run_id=? AND status='FAILED' "
+                   "AND failure_kind IS NOT NULL GROUP BY 1, 2", run_id):
+        per_agent[r["agent"]]["failure_kinds"][r["failure_kind"]] = int(r["n"])
     tasks = _map(conn, "SELECT status, COUNT(*) FROM research_queue WHERE run_id=? GROUP BY 1", run_id)
+    task_gaps = {
+        "failed": tasks.get("FAILED", 0),
+        "done_with_gaps": int(_rows(conn, "SELECT COUNT(*) FROM research_queue WHERE run_id=? AND status='DONE' AND error LIKE 'PARTIAL:%'", run_id)[0][0]),
+        "waiting_retry": int(_rows(conn, "SELECT COUNT(*) FROM research_queue WHERE run_id=? AND status='PENDING' AND not_before IS NOT NULL", run_id)[0][0]),
+    }
+    try:
+        cfg = json.loads(run["config_json"] or "{}")
+    except ValueError:
+        cfg = {}
     n_tasks = max(sum(tasks.values()), 1)
     tokens = int(run["llm_tokens_used"] or 0)
     cost = float(run["llm_cost_usd"] or 0.0)
@@ -57,7 +78,9 @@ def build_report(conn: sqlite3.Connection, run_id: int) -> dict[str, Any]:
         WHERE e.relationship_id=r.relationship_id AND e.quote_verified=1 AND e.supports='OWNERSHIP'
         AND e.source_class IN ('FIRST_PARTY_PARENT','FIRST_PARTY_CHILD','OFFICIAL_DOCUMENT'))""", run_id)[0][0]
     return {
-        "run": {"run_id": run_id, "status": run["status"], "root": run["root_name"], "started_at": run["started_at"],
+        "run": {"run_id": run_id, "status": run["status"], "status_label": run_status_label(run["status"]),
+                "provider": cfg.get("llm_provider") or "unknown", "model": cfg.get("llm_model") or "unknown",
+                "root": run["root_name"], "started_at": run["started_at"],
                 "finished_at": run["finished_at"], "token_budget": run["llm_token_budget"], "tokens_used": tokens,
                 "cost_usd": round(cost, 6)},
         "entities": {"by_status": ents, "non_root": non_root,
@@ -72,6 +95,7 @@ def build_report(conn: sqlite3.Connection, run_id: int) -> dict[str, Any]:
                 "tool_calls_allowed": int(tool[0] or 0), "tool_calls_total": int(tool[1] or 0)},
         "extraction": _extraction(conn, run_id),
         "tasks": tasks,
+        "task_gaps": task_gaps,
         "pages": _map(conn, "SELECT crawl_status, COUNT(*) FROM crawl_pages WHERE run_id=? GROUP BY 1", run_id),
         "gate_rejections": _map(conn, "SELECT gate_code, COUNT(*) FROM gate_rejections WHERE run_id=? GROUP BY 1", run_id),
         "candidates": _map(conn, "SELECT COALESCE(decision,'NONE'), COUNT(*) FROM candidates WHERE run_id=? GROUP BY 1", run_id),
@@ -103,13 +127,14 @@ def _extraction(conn: sqlite3.Connection, run_id: int) -> dict[str, Any]:
 def format_report(rep: dict[str, Any]) -> str:
     r, e, l = rep["run"], rep["entities"], rep["llm"]
     lines = [
-        f"Run {r['run_id']} [{r['status']}] root={r['root']}",
+        f"Run {r['run_id']} [{r['status_label']}] root={r['root']}",
+        f"  LLM: provider={r['provider']} model={r['model']}",
         f"  tokens used: {r['tokens_used']} / {r['token_budget'] or 'unlimited'}   cost: ${r['cost_usd']}",
         f"  entities: {e['by_status']}  review ratio: {e['review_ratio']}  merged: {e['merged']}",
         f"  LLM: {l['provider_calls']} provider calls, {l['cache_hits']} cache hits (rate {l['cache_hit_rate']}), "
         f"{l['calls_per_task']} calls/task, ${l['cost_per_entity_usd']} per entity, {l['tokens_per_entity']} tokens per entity",
         f"  extraction: {rep['extraction']}",
-        f"  tasks: {rep['tasks']}   pages: {rep['pages']}",
+        f"  tasks: {rep['tasks']}   gaps: {rep['task_gaps']}   pages: {rep['pages']}",
         f"  gate rejections: {rep['gate_rejections']}   candidates: {rep['candidates']}",
         f"  review items: {rep['review_items']}   findings: {rep['findings']}   errors: {rep['errors']}",
         f"  integrity: {rep['integrity']}",
@@ -117,5 +142,6 @@ def format_report(rep: dict[str, Any]) -> str:
     for agent, a in sorted(l["per_agent"].items()):
         lines.append(f"    {agent:<26} calls={a['provider_calls']:<4} cache={a['cache_hits']:<4} schema_fail={a['schema_failures']:<3} "
                      f"transport_fail={a['transport_failures']:<3} skipped={a['skipped_by_budget_or_circuit']:<3} "
+                     f"ok={a['ok']:<4} failed={a['failed']:<3} fail_rate={a['failure_rate']} kinds={a['failure_kinds']} "
                      f"tok={a['tokens_in']}/{a['tokens_out']} ${a['cost_usd']}")
     return "\n".join(lines)

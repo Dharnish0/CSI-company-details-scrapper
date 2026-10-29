@@ -24,7 +24,7 @@ from corpdisc.agents.validation import ValidationAgent
 from corpdisc.agents.website import WebsiteAgent
 from corpdisc.clock import Clock, Sleeper, SystemClock
 from corpdisc.contracts.agents import AgentName
-from corpdisc.config import Settings
+from corpdisc.config import PROVIDER_MODEL_FIELDS, Settings
 from corpdisc.db.connection import connect_writer, init_db
 from corpdisc.db.repos.audit import SqliteAuditSink, SqliteResponseCache
 from corpdisc.db.repos.pages import PageRepo
@@ -85,10 +85,6 @@ def latest_run_id(conn: sqlite3.Connection) -> int | None:
 
 def uses_real_provider(settings: Settings) -> bool:
     return (settings.llm_provider or "").strip().lower() in REAL_PROVIDERS
-
-
-# Which Settings field holds the model name for each provider (anything else uses LLM_MODEL).
-PROVIDER_MODEL_FIELDS = {"groq": "groq_model", "gemini": "gemini_model"}
 
 
 def provider_settings_for_run(settings: Settings, *, run_provider: str | None, run_model: str | None) -> Settings:

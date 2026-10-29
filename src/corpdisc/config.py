@@ -14,6 +14,8 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+# Which Settings field holds the model name for each provider (any other provider uses LLM_MODEL).
+PROVIDER_MODEL_FIELDS: dict[str, str] = {"groq": "groq_model", "gemini": "gemini_model"}
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 # Generic tracking parameters removed during URL canonicalization. A trailing '*' is a prefix.
@@ -108,6 +110,8 @@ class Settings(BaseSettings):
     # M8 real providers
     llm_timeout_seconds: float = Field(default=300.0, gt=0)
     llm_base_url: str = ""
+    # Local Ollama server probed by `llms` / `run` (GET /api/tags). LLM_BASE_URL overrides it when LLM_PROVIDER=ollama.
+    ollama_base_url: str = "http://localhost:11434"
     # Ollama (native /api/chat): explicit context window (constant so the model is not reloaded between requests) and keep-alive
     ollama_num_ctx: int = Field(default=12288, ge=1024)
     ollama_keep_alive: str = "30m"
@@ -131,6 +135,9 @@ class Settings(BaseSettings):
     # Gemini-specific configuration
     gemini_model: str = ""
     gemini_api_key: SecretStr | None = None
+    # Thinking for structured calls: "off" (default; thoughts would consume the output cap and truncate the JSON), "low"
+    # (small budget/level plus an output allowance) or "default" (model default plus an allowance).
+    gemini_thinking: Literal["off", "low", "default"] = "off"
     # Groq-specific configuration
     groq_model: str = ""
     groq_api_key: SecretStr | None = None
@@ -239,7 +246,7 @@ class Settings(BaseSettings):
 
     def secret_values(self) -> list[str]:
         """Non-empty secret values, for the logging redactor. Never print the result."""
-        secrets = (self.llm_api_key, self.gemini_api_key, self.groq_api_key)
+        secrets = (self.llm_api_key, self.gemini_api_key, self.groq_api_key, self.search_api_key)
         return [s.get_secret_value() for s in secrets if s is not None and s.get_secret_value()]
 
 
