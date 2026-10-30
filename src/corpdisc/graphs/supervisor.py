@@ -20,7 +20,7 @@ from corpdisc.contracts.postgate import CommitPlan, CommitRejected, EntityWrite,
 from corpdisc.db.repos.runs import RunRepo
 from corpdisc.graphs.deps import ResearchDeps
 from corpdisc.graphs.finalize import FinalizeGraph, FinalizeResult
-from corpdisc.graphs.research import ResearchGraph, TaskCtx
+from corpdisc.graphs.research import CommitRejectedError, ResearchGraph, TaskCtx
 from corpdisc.logging_setup import get_logger
 from corpdisc.models.domain import (
     CrawlState,
@@ -160,7 +160,9 @@ class Supervisor:
             except Exception as exc:  # noqa: BLE001 - one bad task never kills the run
                 log.exception("task %s crashed", task.task_id)
                 d.pages_repo.add_crawl_error(d.run_id, "TASK", type(exc).__name__, str(exc)[:400], entity_id=task.entity_id)
-                status = d.queue.fail(task.task_id, f"{type(exc).__name__}: {exc}"[:500])
+                # a rejected commit is deterministic: a retry would be rejected identically
+                status = d.queue.fail(task.task_id, f"{type(exc).__name__}: {exc}"[:500],
+                                      retry=not isinstance(exc, CommitRejectedError))
                 summary.outcomes["FAILED" if status.value == "FAILED" else "RETRY"] += 1
                 summary.failed_tasks += status.value == "FAILED"
                 continue

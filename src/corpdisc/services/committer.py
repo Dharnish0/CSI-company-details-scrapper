@@ -114,7 +114,12 @@ class Committer:
         except sqlite3.IntegrityError as exc:
             conn.rollback()
             msg = str(exc)
-            code = "INV4" if "idx_one_primary_parent" in msg or "relationships.child_id" in msg else "INV_FIELDS"
+            if "idx_one_primary_parent" in msg or msg.endswith("UNIQUE constraint failed: relationships.child_id"):
+                code = "INV4"
+            elif "relationships.parent_id, relationships.child_id" in msg:
+                code = "INV_DUPLICATE_EDGE"
+            else:
+                code = "INV_FIELDS"
             log.info("commit rejected run=%s task=%s integrity: %s", plan.run_id, plan.task_id, msg)
             return CommitRejected(failed_invariant=code, message=f"integrity error: {msg}"[:500])
         except Exception:
@@ -230,6 +235,25 @@ class Committer:
                 if hit is not None:
                     dup_of = int(hit[0])
                     duplicates.append(_v("INV_DUPLICATE", f"{norm!r} already exists under parent {parent}", child))
+            old = c.execute(
+                "SELECT relationship_id, relationship_type, verification_status, confidence, is_primary, source_page_id "
+                "FROM relationships WHERE parent_id = ? AND child_id = ?", (parent, child)).fetchone()
+            if old is not None:
+                # idempotent merge: the edge already exists (earlier commit, retry, or a second write in this plan)
+                new_status = r.verification_status.value
+                status = old["verification_status"]
+                if status == "REJECTED" or (status == "REVIEW_REQUIRED" and new_status == _CONFIRMED):
+                    status = new_status if new_status != "REJECTED" else status
+                rtype = r.relationship_type.value if old["relationship_type"] == "Unknown" else old["relationship_type"]
+                primary = int(bool(old["is_primary"]) or (r.is_primary and status == _CONFIRMED))
+                c.execute(
+                    "UPDATE relationships SET relationship_type = ?, verification_status = ?, confidence = ?, "
+                    "is_primary = ?, source_page_id = COALESCE(source_page_id, ?) WHERE relationship_id = ?",
+                    (rtype, status, max(float(old["confidence"]), float(r.confidence)), primary, r.source_page_id,
+                     old["relationship_id"]))
+                rel[r.local_ref] = int(old["relationship_id"])
+                touched.update((parent, child))  # type: ignore[arg-type]
+                continue
             cur = c.execute(
                 "INSERT INTO relationships (parent_id, child_id, relationship_type, verification_status, confidence, "
                 "is_primary, source_page_id, discovery_method, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -246,6 +270,11 @@ class Committer:
             eid = self._resolve(ev.entity, ent)
             rid = rel[ev.relationship_local_ref] if ev.relationship_local_ref else ev.relationship_id
             x = ev.evidence
+            if rid is not None and c.execute(
+                    "SELECT 1 FROM evidence WHERE relationship_id = ? AND entity_id IS ? AND page_id IS ? AND quote = ?",
+                    (rid, eid, x.page_id, x.quote)).fetchone() is not None:
+                touched.add(eid)  # type: ignore[arg-type]
+                continue  # identical evidence already stored
             cur = c.execute(
                 "INSERT INTO evidence (entity_id, relationship_id, page_id, url, quote, quote_verified, source_class, "
                 "supports, invocation_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",

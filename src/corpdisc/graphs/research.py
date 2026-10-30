@@ -80,6 +80,14 @@ from corpdisc.services.urls import canonicalize_url
 
 log = get_logger("graphs.research")
 
+
+class CommitRejectedError(RuntimeError):
+    """The committer rejected a plan. Deterministic: re-running the same task is rejected identically."""
+
+    def __init__(self, failed_invariant: str, message: str) -> None:
+        super().__init__(f"commit rejected: {failed_invariant}: {message}")
+        self.failed_invariant = failed_invariant
+
 HIGH_BAND: Final = 0.60  # at or above: straight to the gate
 LOW_BAND: Final = 0.20  # at or below: nothing relevant
 EXTRACT_MIN_CONF: Final = 0.35
@@ -655,6 +663,26 @@ class ResearchGraph:
                 "conf": getattr(e, "agent_confidence", None), "ptype": getattr(getattr(e, "proposed_type", None), "value", None),
                 "ref": resolved_ref, "resolved_id": resolved_id}
 
+    def _is_ancestor_level_ref(self, t: TaskCtx, known_id: int) -> bool:
+        """True when ``known_id`` already belongs to one of the task entity's ancestors (a sibling or uncle of the
+        task entity). A page of the task entity naming it is not evidence that the task entity owns it."""
+        parents = {r[0] for r in self.d.conn.execute(
+            "SELECT parent_id FROM relationships WHERE child_id=? AND is_primary=1 AND verification_status='CONFIRMED'",
+            (known_id,))}
+        return bool(parents & set(t.ancestry))
+
+    @staticmethod
+    def _sibling_reason(t: TaskCtx, known_id: int) -> str:
+        return (f"SIBLING_REFERENCE: names entity {known_id}, which already belongs to an ancestor of "
+                f"{t.entity_id}; ownership by {t.entity_id} not accepted")
+
+    @staticmethod
+    def _sibling_review(t: TaskCtx, known_id: int) -> dict[str, Any]:
+        return {"entity_id": known_id, "possible_parent_id": t.entity_id, "reason": ReviewReason.MULTI_PARENT.value,
+                "text": f"SIBLING_REFERENCE: a page of entity {t.entity_id} names entity {known_id}, which already "
+                        "belongs to an ancestor; the edge was not stored",
+                "action": "Verify whether this page's company really owns it; the edge was not stored."}
+
     def n_match_known(self, s: ResearchState) -> dict[str, Any]:
         t, d, sc = s.task, self.d, self.sc(s)
         anc_names = {r["normalized_name"]: r["entity_id"] for r in d.conn.execute(
@@ -690,9 +718,16 @@ class ResearchGraph:
             elif c.known_id is not None:
                 existing = d.conn.execute("SELECT relationship_id FROM relationships WHERE parent_id=? AND child_id=?",
                                           (t.entity_id, c.known_id)).fetchone()
-                c.dropped = "known_same_parent" if existing else "known_other_parent"
-                rows.append(self._row(ch, c.name, c.kind, "DUPLICATE", "matched an existing entity", None,
-                                      resolved_id=c.known_id))
+                if not existing and self._is_ancestor_level_ref(t, c.known_id):
+                    c.dropped = "known_sibling"
+                    rows.append(self._row(ch, c.name, c.kind, "REVIEW", self._sibling_reason(t, c.known_id), None,
+                                          resolved_id=c.known_id))
+                    if not any(r["entity_id"] == c.known_id for r in reviews):
+                        reviews.append(self._sibling_review(t, c.known_id))
+                else:
+                    c.dropped = "known_same_parent" if existing else "known_other_parent"
+                    rows.append(self._row(ch, c.name, c.kind, "DUPLICATE", "matched an existing entity", None,
+                                          resolved_id=c.known_id))
             out.append(c)
         new = [c for c in out if not c.dropped]
         upd = {"cands": out, "cand_rows": rows, "rejections": rej, "reviews": reviews}
@@ -795,7 +830,7 @@ class ResearchGraph:
         return {"cands": s.cands, "rejections": rej, "route": "dedupe_resolve"}
 
     def n_dedupe_resolve(self, s: ResearchState) -> dict[str, Any]:
-        d, rows = self.d, []
+        d, rows, sib_reviews = self.d, [], []
         by_dom: dict[str, Cand] = {}
         for c in s.cands:
             if c.dropped:
@@ -803,7 +838,16 @@ class ResearchGraph:
             if c.ambiguous_ids and d.dedup is not None:
                 verdict = d.dedup.judge(d, c.name, s.task.entity_id, c.ambiguous_ids)
                 if verdict == "SAME":
-                    c.known_id, c.dropped = c.ambiguous_ids[0], "known_other_parent"
+                    c.known_id = c.ambiguous_ids[0]
+                    t = s.task
+                    if self._is_ancestor_level_ref(t, c.known_id) and not d.conn.execute(
+                            "SELECT 1 FROM relationships WHERE parent_id=? AND child_id=?", (t.entity_id, c.known_id)).fetchone():
+                        c.dropped = "known_sibling"
+                        rows.append(self._row(self.sc(s).chunks[c.chunk_key], c.name, c.kind, "REVIEW",
+                                              self._sibling_reason(t, c.known_id), None, resolved_id=c.known_id))
+                        sib_reviews.append(self._sibling_review(t, c.known_id))
+                    else:
+                        c.dropped = "known_other_parent"
                     continue
             reg = registrable_domain(c.site_url) if c.site_url and c.site_kind == WebsiteKind.OFFICIAL.value else None
             if reg and reg in by_dom:  # two references to the same company: keep the first, alias the second
@@ -815,7 +859,8 @@ class ResearchGraph:
             elif reg:
                 by_dom[reg] = c
         new = [c for c in s.cands if not c.dropped]
-        return {"cands": s.cands, "cand_rows": rows, "route": "relationship_agent" if new else "commit"}
+        return {"cands": s.cands, "cand_rows": rows, "reviews": sib_reviews,
+                "route": "relationship_agent" if new else "commit"}
 
     def n_relationship_agent(self, s: ResearchState) -> dict[str, Any]:
         t, sc = s.task, self.sc(s)
@@ -944,27 +989,45 @@ class ResearchGraph:
         parent_ref = EntityRef(entity_id=t.entity_id)
         entities, websites, rels, evs, aliases, cands_w, reviews = [], [], [], [], [], [], []
         rows = list(s.cand_rows)
+        known_done: set[int] = set()
         for c in s.cands:
             ch = sc.chunks[c.chunk_key]
             if c.dropped == "duplicate_in_batch":
                 aliases.append(AliasWrite(entity=EntityRef(local_ref=c.duplicate_of), alias=c.name[:300],
                                           normalized_alias=c.norm, source_page_id=c.page_id))
                 continue
+            if c.dropped == "known_sibling":
+                continue  # reviewed, never stored as an edge (the candidate row and review item were queued earlier)
             if c.dropped in ("known_same_parent", "known_other_parent") and c.known_id:
+                if c.known_id in known_done:
+                    continue  # every candidate resolving to this known entity was handled with the first one
+                known_done.add(c.known_id)
+                group = [g for g in s.cands if g.known_id == c.known_id
+                         and g.dropped in ("known_same_parent", "known_other_parent")]
+                known_ref = EntityRef(entity_id=c.known_id)
                 rid = d.conn.execute("SELECT relationship_id FROM relationships WHERE parent_id=? AND child_id=?",
                                      (t.entity_id, c.known_id)).fetchone()
-                if c.claim and c.claim.quote_verified and rid:
-                    evs.append(EvidenceWrite(entity=EntityRef(entity_id=c.known_id), relationship_id=rid[0], evidence=c.claim))
-                elif c.dropped == "known_other_parent":
+                claims = [g.claim for g in group if g.claim]
+                verified = [x for x in claims if x.quote_verified]
+                if rid and verified:
+                    for x in verified:
+                        evs.append(EvidenceWrite(entity=known_ref, relationship_id=rid[0], evidence=x))
+                elif not rid and any(g.dropped == "known_other_parent" for g in group):
+                    # exactly one edge per (parent, known entity); all name variants contribute evidence
                     lr = f"k{c.ref}"
-                    rels.append(RelationshipWrite(local_ref=lr, parent=parent_ref, child=EntityRef(entity_id=c.known_id),
+                    rels.append(RelationshipWrite(local_ref=lr, parent=parent_ref, child=known_ref,
                                                   relationship_type=RelationshipType.UNKNOWN, verification_status=VerificationStatus.REVIEW_REQUIRED,
                                                   confidence=0.4, is_primary=False, source_page_id=c.page_id, discovery_method=c.dom_hint))
-                    if c.claim:
-                        evs.append(EvidenceWrite(entity=EntityRef(entity_id=c.known_id), relationship_local_ref=lr, evidence=c.claim))
-                    reviews.append(ReviewItemWrite(entity=EntityRef(entity_id=c.known_id), possible_parent=parent_ref,
+                    for x in claims:
+                        evs.append(EvidenceWrite(entity=known_ref, relationship_local_ref=lr, evidence=x))
+                    reviews.append(ReviewItemWrite(entity=known_ref, possible_parent=parent_ref,
                                                    reason_code=ReviewReason.MULTI_PARENT, reason_text=f"{c.name!r} is also referenced by entity {t.entity_id}",
                                                    recommended_action="Decide which parent owns this entity."))
+                known_norm = d.conn.execute("SELECT normalized_name FROM entities WHERE entity_id=?", (c.known_id,)).fetchone()
+                for g in group:  # name variants resolved by the matcher (not ambiguous ids) become aliases
+                    if not g.ambiguous_ids and known_norm and g.norm != known_norm[0]:
+                        aliases.append(AliasWrite(entity=known_ref, alias=g.name[:300], normalized_alias=g.norm,
+                                                  source_page_id=g.page_id))
                 continue
             if c.dropped or c.status is None:
                 continue
@@ -1002,7 +1065,12 @@ class ResearchGraph:
                     entity=child, possible_parent=parent_ref, reason_code=code,
                     reason_text=f"{c.name!r}: {code.value}", recommended_action="Review the evidence and the website manually.",
                     confidence=c.rel_conf))
+        seen_reviews: set[tuple[Any, ...]] = set()
         for r in s.reviews:
+            key = (r["entity_id"], r["possible_parent_id"], r["reason"], r["text"])
+            if key in seen_reviews:
+                continue
+            seen_reviews.add(key)
             reviews.append(ReviewItemWrite(entity=EntityRef(entity_id=r["entity_id"]),
                                            possible_parent=EntityRef(entity_id=r["possible_parent_id"]) if r["possible_parent_id"] else None,
                                            reason_code=ReviewReason(r["reason"]), reason_text=r["text"][:500], recommended_action=r["action"][:500]))
@@ -1026,7 +1094,7 @@ class ResearchGraph:
         res = d.committer.commit(plan)
         if isinstance(res, CommitRejected):
             d.pages_repo.add_crawl_error(t.run_id, "REGISTRY", res.failed_invariant, res.message, entity_id=t.entity_id)
-            raise RuntimeError(f"commit rejected: {res.failed_invariant}: {res.message}")
+            raise CommitRejectedError(res.failed_invariant, res.message)
         ids = {ref: eid for ref, eid in res.entity_ids.items()}
         return {"committed_ids": list(ids.values()), "ref_ids": ids, "route": "route_enqueue"}
 

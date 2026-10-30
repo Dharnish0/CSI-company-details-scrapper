@@ -199,3 +199,104 @@ def test_whole_run_check_catches_text_changed_after_commit(env):
     assert isinstance(committer.commit(full_plan(run, page)), CommitResult)
     texts[page] = "the page now says something else entirely"
     assert {v.code for v in committer.check_invariants()} == {"INV2"}
+
+
+# ---------------------------------------------------------------- idempotent, merge-aware edges (Phase 4, defect A)
+def _first_commit(env):
+    conn, run, page, _, committer = env
+    out = committer.commit(full_plan(run, page))
+    assert isinstance(out, CommitResult), out
+    return out.entity_ids["root"], out.entity_ids["c1"]
+
+
+def _edge_rows(conn, rid, cid):
+    return conn.execute("SELECT * FROM relationships WHERE parent_id=? AND child_id=?", (rid, cid)).fetchall()
+
+
+def test_duplicate_edge_in_one_plan_merges_instead_of_rejecting(env):
+    conn, run, page, _, committer = env
+    rid, cid = _first_commit(env)
+    p, k = EntityRef(entity_id=rid), EntityRef(entity_id=cid)
+    plan = CommitPlan(
+        run_id=run,
+        relationships=(rel(p, k, "a", status=VS.REVIEW_REQUIRED, conf=0.4), rel(p, k, "b", status=VS.REVIEW_REQUIRED, conf=0.6)),
+        evidence=(EvidenceWrite(entity=k, relationship_local_ref="a", evidence=evidence(page, QUOTE)),
+                  EvidenceWrite(entity=k, relationship_local_ref="b", evidence=evidence(page, "Aurora Analytics is a wholly owned"))),
+    )
+    out = committer.commit(plan)
+    assert isinstance(out, CommitResult), out
+    rows = _edge_rows(conn, rid, cid)
+    assert len(rows) == 1
+    assert rows[0]["verification_status"] == "CONFIRMED" and rows[0]["confidence"] == 0.85
+    assert out.relationship_ids["a"] == out.relationship_ids["b"] == rows[0]["relationship_id"]
+    assert count(conn, "evidence WHERE relationship_id=%d" % rows[0]["relationship_id"]) == 2
+
+
+def test_existing_edge_upsert_keeps_best_confidence_and_adds_evidence(env):
+    conn, run, page, _, committer = env
+    rid, cid = _first_commit(env)
+    p, k = EntityRef(entity_id=rid), EntityRef(entity_id=cid)
+    before = count(conn, "evidence")
+    for _ in range(2):  # the second identical commit must not duplicate evidence
+        out = committer.commit(CommitPlan(
+            run_id=run, relationships=(rel(p, k, "x", status=VS.CONFIRMED, conf=0.8),),
+            evidence=(EvidenceWrite(entity=k, relationship_local_ref="x",
+                                    evidence=evidence(page, "Aurora Analytics is a wholly owned")),)))
+        assert isinstance(out, CommitResult), out
+    rows = _edge_rows(conn, rid, cid)
+    assert len(rows) == 1 and rows[0]["confidence"] == 0.85
+    assert count(conn, "evidence") == before + 1
+
+
+def test_upsert_never_downgrades_confirmed_or_bypasses_inv1_inv4(env):
+    conn, run, page, _, committer = env
+    rid, cid = _first_commit(env)
+    p, k = EntityRef(entity_id=rid), EntityRef(entity_id=cid)
+    out = committer.commit(CommitPlan(run_id=run, relationships=(rel(p, k, "x", status=VS.REVIEW_REQUIRED, conf=0.3),)))
+    assert isinstance(out, CommitResult)
+    assert _edge_rows(conn, rid, cid)[0]["verification_status"] == "CONFIRMED"
+    # a brand-new REVIEW edge promoted to CONFIRMED without verified evidence is rejected (INV1) and rolled back
+    gid = committer.commit(CommitPlan(run_id=run, entities=(child("g", "Zenith Works", status=VS.REVIEW_REQUIRED),),
+                                      relationships=(rel(p, EntityRef(local_ref="g"), "rg", status=VS.REVIEW_REQUIRED, conf=0.5),),
+                                      websites=(site(EntityRef(local_ref="g"), "wg", "https://zenith.test/"),)))
+    assert isinstance(gid, CommitResult), gid
+    zid = gid.entity_ids["g"]
+    bad = committer.commit(CommitPlan(run_id=run, relationships=(rel(p, EntityRef(entity_id=zid), "rz", conf=0.9),)))
+    assert isinstance(bad, CommitRejected) and bad.failed_invariant == "INV1"
+    assert _edge_rows(conn, rid, zid)[0]["verification_status"] == "REVIEW_REQUIRED"
+
+
+def test_duplicate_edge_integrity_error_is_not_labelled_inv4(env, monkeypatch):
+    import sqlite3
+    conn, run, page, _, committer = env
+
+    def boom(plan):
+        raise sqlite3.IntegrityError("UNIQUE constraint failed: relationships.parent_id, relationships.child_id")
+    monkeypatch.setattr(committer, "_apply", boom)
+    out = committer.commit(full_plan(run, page))
+    assert isinstance(out, CommitRejected) and out.failed_invariant == "INV_DUPLICATE_EDGE"
+    assert not conn.in_transaction
+
+
+def test_failed_commit_leaves_no_partial_rows(env, monkeypatch):
+    conn, run, page, _, committer = env
+    before = {t: count(conn, t) for t in TABLES}
+    real = committer._merge
+
+    def boom(*a, **k):
+        raise RuntimeError("mid-apply failure")
+    monkeypatch.setattr(committer, "_merge", boom)
+    from corpdisc.contracts.postgate import MergeWrite
+    plan = full_plan(run, page, merges=(MergeWrite(keep_id=1, drop_id=2, reason="x"),))
+    with pytest.raises(RuntimeError):
+        committer.commit(plan)
+    assert not conn.in_transaction
+    assert {t: count(conn, t) for t in TABLES} == before
+    monkeypatch.setattr(committer, "_merge", real)
+    # an invariant failure after rows were written is also fully rolled back
+    bad = full_plan(run, page, evidence=())
+    out = committer.commit(bad)
+    assert isinstance(out, CommitRejected) and out.failed_invariant == "INV1"
+    assert {t: count(conn, t) for t in TABLES} == before
+
+
