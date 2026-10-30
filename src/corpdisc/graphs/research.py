@@ -809,6 +809,34 @@ class ResearchGraph:
                         "belongs to an ancestor; the edge was not stored",
                 "action": "Verify whether this page's company really owns it; the edge was not stored."}
 
+    def _exact_name_entities(self, t: TaskCtx, norm: str) -> list[tuple[int, str]]:
+        """Live entities of the run whose normalized name equals ``norm`` and that this task entity has no edge to. An empty
+        list when the task entity already links to one of them (that is the ordinary same-parent match)."""
+        found = [(r[0], r[1]) for r in self.d.conn.execute(
+            "SELECT entity_id, name FROM entities WHERE run_id=? AND merged_into_id IS NULL AND normalized_name=? "
+            "AND entity_id<>?", (t.run_id, norm, t.entity_id))]
+        linked = {eid for eid, _ in found if self.d.conn.execute(  # only an owning (primary) edge makes it "its own child"
+            "SELECT 1 FROM relationships WHERE parent_id=? AND child_id=? AND is_primary=1 "
+            "AND verification_status<>'REJECTED'", (t.entity_id, eid)).fetchone()}
+        return [] if linked else found
+
+    def _exact_name_reason(self, t: TaskCtx, c: Cand, exact: list[tuple[int, str]]) -> str:
+        who = ", ".join(f"{ename!r} (entity {eid})" for eid, ename in exact)
+        head = self._sibling_reason(t, exact[0][0]) + "; " if self._is_ancestor_level_ref(t, exact[0][0]) else ""
+        return (f"{head}EXACT_NAME_MATCH: {c.name!r} on a page of {t.entity_name!r} (entity {t.entity_id}) has the same "
+                f"normalized name as existing {who}; no new entity or edge was stored")
+
+    def _exact_name_review(self, t: TaskCtx, c: Cand, eid: int, ename: str) -> dict[str, Any]:
+        """Review item for an exact-name claim. A name that already sits under an ancestor of the task entity (a sibling
+        group) keeps the sibling wording and MULTI_PARENT; any other exact match is an AMBIGUOUS_NAME."""
+        names = f"{c.name!r} on a page of {t.entity_name!r} (entity {t.entity_id}) vs existing {ename!r} (entity {eid})"
+        if self._is_ancestor_level_ref(t, eid):
+            r = self._sibling_review(t, eid)
+            return {**r, "text": f"{r['text']} [EXACT_NAME_MATCH: {names}]"}
+        return {"entity_id": eid, "possible_parent_id": t.entity_id, "reason": ReviewReason.AMBIGUOUS_NAME.value,
+                "text": f"EXACT_NAME_MATCH: same normalized name, {names}; no new entity or edge was stored",
+                "action": "Decide whether these are the same organisation (merge or add a parent) or two different ones."}
+
     def n_match_known(self, s: ResearchState) -> dict[str, Any]:
         t, d, sc = s.task, self.d, self.sc(s)
         anc_names = {r["normalized_name"]: r["entity_id"] for r in d.conn.execute(
@@ -822,6 +850,18 @@ class ResearchGraph:
             hit: list[int] = []
             if c.norm in anc_names:  # the page names the entity itself or one of its ancestors
                 hit = [anc_names[c.norm]]
+            elif exact := self._exact_name_entities(t, c.norm):
+                # An entity of this run already carries exactly this name and this parent has no edge to it. Whatever the
+                # dedup agent might say, no second entity and no second edge is stored: a person decides (b).
+                c.dropped = "exact_name_claim"
+                rows.append(self._row(ch, c.name, c.kind, "REVIEW", self._exact_name_reason(t, c, exact), None,
+                                      resolved_id=exact[0][0]))
+                for eid, ename in exact:  # one open item per (entity, claiming parent): a re-run adds nothing
+                    if not d.conn.execute("SELECT 1 FROM review_items WHERE run_id=? AND entity_id=? AND possible_parent_id=? "
+                                          "AND reason_text LIKE '%EXACT_NAME_MATCH%'", (t.run_id, eid, t.entity_id)).fetchone():
+                        reviews.append(self._exact_name_review(t, c, eid, ename))
+                out.append(c)
+                continue
             else:
                 m = d.matcher.find_match(MatchCandidate(
                     name=c.name, normalized_name=c.norm, parent_entity_id=t.entity_id,

@@ -64,10 +64,11 @@ def test_c_products_never_become_entities(full):
 def test_d_duplicates_are_resolved_deterministically(full, tmp_path):
     w, _ = full
     assert Counter(r[0] for r in w.q("SELECT name FROM entities")).most_common(1)[0][1] == 1
-    assert w.entity("Company A2") is not None and w.edge("Group B", "Company A2")["verification_status"] == "REVIEW_REQUIRED"
-    assert w.edge("Group B", "Company A2")["is_primary"] == 0  # the first parent keeps the primary edge
-    assert w.edge("Group A", "Company A2")["verification_status"] == "CONFIRMED"
-    assert ("Company A2", "MULTI_PARENT") in [(r[0], r[1]) for r in w.q(
+    # an exact-name match to an existing entity never adds a second parent edge or a second entity: it is reviewed
+    assert w.entity("Company A2") is not None and w.edge("Group B", "Company A2") is None
+    assert w.edge("Group A", "Company A2")["verification_status"] == "CONFIRMED"  # the first parent keeps its edge
+    assert w.edge("Group A", "Company A2")["is_primary"] == 1
+    assert ("Company A2", "AMBIGUOUS_NAME") in [(r[0], r[1]) for r in w.q(
         "SELECT e.name, r.reason_code FROM review_items r JOIN entities e USING(entity_id)")]
     assert w.q("SELECT 1 FROM entities WHERE name='A1 Analytics'") == []  # second reference to Company A1's site
     alias = w.q("SELECT a.normalized_alias FROM entity_aliases a JOIN entities e USING(entity_id) WHERE e.name='Company A1'")
