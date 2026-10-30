@@ -95,6 +95,8 @@ class AgentError(Strict):
     message: str = Field(max_length=500)
     retryable: bool = False  # transient transport failure: the caller may reschedule the work
     retry_after_s: float | None = None  # server-requested delay (e.g. HTTP 429 Retry-After)
+    truncated: bool = False  # the model hit the output token cap (finish_reason=length): re-ask with less input
+    rate_limited: bool = False  # HTTP 429 after the in-call retries: the work is intact, only waiting is needed
 
 
 In = TypeVar("In", bound=BaseModel)

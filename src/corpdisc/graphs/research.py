@@ -98,6 +98,13 @@ ENTRY_MIN_DOM_CANDIDATES: Final = 3  # a start page without a listing URL needs 
 _LISTING_TYPES: Final = frozenset({PageType.COMPANIES, PageType.PORTFOLIO, PageType.BRANDS, PageType.SUBSIDIARIES,
                                  PageType.OPERATING_GROUPS})
 MAX_CHUNKS_PER_PAGE: Final = 6
+# Output-limit awareness. The extraction agent caps output at 3000 tokens (hard cap 8192) and one ExtractedEntity (name, verbatim
+# quote, reason, description) can cost 100-250 of them, so a dense chunk can outgrow the cap. A chunk that hits
+# finish_reason=length is split in halves and re-asked, up to MAX_SPLIT_DEPTH; the size that failed is remembered, and the
+# remaining chunks of the task are split BEFORE their call when they offer more DOM candidates than two thirds of it.
+MIN_LEARNED_CAP: Final = 5
+MAX_SPLIT_DEPTH: Final = 3
+MIN_SPLIT_CHARS: Final = 800
 REL_BATCH: Final = 15
 WINDOW: Final = 1500
 CRAWLABLE_TYPES: Final = frozenset({
@@ -188,6 +195,8 @@ class ResearchState(BaseModel):
     rel_unavailable: bool = False
     retry_after_s: float | None = None
     retry_reason: str = ""
+    rate_limited: bool = False  # the transient failure was an HTTP 429 (nothing wrong, only waiting needed)
+    transient_incomplete: bool = False  # a provider call failed transiently: the missing part can be redone later
     terminal_reason: str = ""  # why a TERMINAL/UNREACHABLE/NO_WEBSITE task ended without extracting (never left empty)
     outcome: Outcome | None = None
     budget_scope: Literal["task", "run"] | None = None
@@ -210,6 +219,8 @@ class ResearchResult:
     retry_after_s: float | None = None
     retry_reason: str = ""
     reason: str = ""
+    rate_limited: bool = False
+    transient_incomplete: bool = False
 
 
 @dataclass
@@ -224,9 +235,12 @@ class Scratch:
     extractions: list[tuple[str, ExtractionOutput]] = None  # type: ignore[assignment]
     parent_regs: set[str] = None  # type: ignore[assignment]
     hits: dict[str, dict[int, str]] = None  # type: ignore[assignment]
+    page_dom: dict[int, Any] = None  # type: ignore[assignment]
+    learned_cap: int | None = None  # DOM candidates per call that were seen to outgrow the output cap, halved
 
     def __post_init__(self) -> None:
         self.page_indexes, self.chunks, self.extractions, self.parent_regs, self.hits = {}, {}, [], set(), {}
+        self.page_dom = {}
 
 
 def _rej(gate: str, ref: str, detail: str, inv: int | None = None) -> dict[str, Any]:
@@ -281,6 +295,21 @@ def _side_data(dom, all_links, chunk_text: str, low: str):  # type: ignore[no-un
     return kept, links
 
 
+def _split_text(text: str, offset: int) -> list[tuple[str, int]]:
+    """Split ``text`` (starting at page offset ``offset``) into two halves at the line break nearest its middle.
+
+    The separating newline is dropped, so ``len(a) + 1 + len(b) == len(text)`` and the second offset is exact. Returns the
+    unsplit ``[(text, offset)]`` when no line break leaves both halves at least ``MIN_SPLIT_CHARS`` long."""
+    mid, best = len(text) // 2, None
+    for i, ch in enumerate(text):
+        if ch == "\n" and i >= MIN_SPLIT_CHARS and len(text) - i - 1 >= MIN_SPLIT_CHARS:
+            if best is None or abs(i - mid) < abs(best - mid):
+                best = i
+    if best is None:
+        return [(text, offset)]
+    return [(text[:best], offset), (text[best + 1:], offset + best + 1)]
+
+
 def _title(html: str | None) -> str | None:
     if not html:
         return None
@@ -323,7 +352,7 @@ class ResearchGraph:
         st = final if isinstance(final, ResearchState) else ResearchState(**final)
         return ResearchResult(st.outcome or "TERMINAL", tuple(st.committed_ids), tuple(st.enqueued_task_ids),
                               tuple(st.errors), st.budget_scope, len(st.rejections),
-                              st.retry_after_s, st.retry_reason, self._reason(st))
+                              st.retry_after_s, st.retry_reason, self._reason(st), st.rate_limited, st.transient_incomplete)
 
     @staticmethod
     def _reason(st: ResearchState) -> str:
@@ -592,20 +621,40 @@ class ResearchGraph:
                 off += len(ln) + 1
             if cur:
                 chunks.append(("\n".join(cur), start))
+            sc.page_dom[pid] = dom
             truncated = len(chunks) > MAX_CHUNKS_PER_PAGE
             for i, (ctext, coff) in enumerate(chunks[:MAX_CHUNKS_PER_PAGE]):
-                low = ctext.lower()
-                cdom, links = _side_data(dom, idx.links, ctext, low)
-                key = f"{pid}:{i}"
-                sc.chunks[key] = {
-                    "page_id": pid, "url": row.canonical_url, "page_type": ptype, "text": ctext, "offset": coff,
-                    "index": i, "count": min(len(chunks), MAX_CHUNKS_PER_PAGE), "truncated": truncated and i == MAX_CHUNKS_PER_PAGE - 1,
-                    "dom": cdom, "link_ids": {lk.link_id for lk in links}, "links": idx.to_refs([lk.link_id for lk in links]),
-                    "page_text": text, "source_class": self.source_class(s, row.canonical_url),
-                }  # fmt: skip
+                base = {"page_id": pid, "url": row.canonical_url, "page_type": ptype, "index": i,
+                        "count": min(len(chunks), MAX_CHUNKS_PER_PAGE), "truncated": truncated and i == MAX_CHUNKS_PER_PAGE - 1,
+                        "page_text": text, "source_class": self.source_class(s, row.canonical_url), "depth": 0}
+                self._add_chunk(sc, f"{pid}:{i}", base, ctext, coff)
         if sc.chunks:
             return {"route": "extraction_agent"}
         return {"route": "mark_terminal", "terminal_reason": "NO_EXTRACTABLE_TEXT"}
+
+    def _add_chunk(self, sc: Scratch, key: str, base: dict[str, Any], ctext: str, coff: int) -> list[str]:
+        """Register the chunk ``key`` with side data derived from the whole page (so quotes still verify against it)."""
+        pid = base["page_id"]
+        idx = sc.page_indexes[pid]
+        cdom, links = _side_data(sc.page_dom[pid], idx.links, ctext, ctext.lower())
+        sc.chunks[key] = {**base, "text": ctext, "offset": coff, "dom": cdom, "link_ids": {lk.link_id for lk in links},
+                          "links": idx.to_refs([lk.link_id for lk in links])}
+        return [key]
+
+    def _split_failed_chunk(self, sc: Scratch, key: str) -> list[str]:
+        """After finish_reason=length: replace ``key`` by its two halves (one level deeper). Empty when it cannot shrink."""
+        ch = sc.chunks[key]
+        if ch["depth"] >= MAX_SPLIT_DEPTH:
+            return []
+        halves = _split_text(ch["text"], ch["offset"])
+        if len(halves) < 2:
+            return []
+        base = {k: v for k, v in ch.items() if k not in ("text", "offset", "dom", "link_ids", "links")}
+        out: list[str] = []
+        for j, (htext, hoff) in enumerate(halves):
+            half = {**base, "depth": ch["depth"] + 1, "truncated": ch["truncated"] and j == 1}
+            out += self._add_chunk(sc, f"{key}.{j}", half, htext, hoff)
+        return out
 
     def _ground(self, out: ExtractionOutput, ch: dict[str, Any]) -> tuple[list[tuple[Any, str]], list[Any]]:
         """G1/G2/G3 for one chunk output (shared pure implementation in graphs.grounding)."""
@@ -618,8 +667,15 @@ class ResearchGraph:
         parent = self.card(t.entity_id, t.entity_name)
         allowed = [x for x in EntityType if x not in (EntityType.PARENT_COMPANY, EntityType.UNKNOWN)]
         partial, errors, rej, inv_reviews = False, [], [], []
+        transient = False
         retry_resp: AgentResponse | None = None
-        for key, ch in sc.chunks.items():
+        pending = list(sc.chunks)
+        while pending:
+            key = pending.pop(0)
+            ch = sc.chunks[key]
+            if sc.learned_cap is not None and len(ch["dom"]) > sc.learned_cap and (subs := self._split_failed_chunk(sc, key)):
+                pending[0:0] = subs  # an earlier chunk of this task was truncated: do not repeat the mistake
+                continue
             payload = ExtractionInput(
                 parent=parent, chunk_index=ch["index"], chunk_count=ch["count"], dom_candidates=ch["dom"],
                 links=ch["links"], allowed_entity_types=allowed,
@@ -630,8 +686,19 @@ class ResearchGraph:
             errors += extra.get("errors", [])
             if (why := self.budget_reason(resp)) and "TOKEN_BUDGET" in why:
                 return self.stop(why, "run")
+            if resp.error is not None and resp.error.truncated:  # the answer outgrew the output cap: smaller re-ask
+                sc.learned_cap = max(MIN_LEARNED_CAP, min(sc.learned_cap or 10**6, len(ch["dom"]) * 2 // 3))
+                subs = self._split_failed_chunk(sc, key)
+                if subs:
+                    errors.append(f"extraction: chunk {key} truncated, re-asking as {len(subs)} smaller chunks")
+                    pending[0:0] = subs
+                else:
+                    partial = True
+                    rej.append(_rej("G12", key, "extraction truncated at max split depth"))
+                continue
             if resp.status is not CallStatus.OK or resp.payload is None:
                 partial = True
+                transient = transient or bool(resp.error is not None and resp.error.retryable)
                 if retry_resp is None and self.should_retry_later(s, resp):
                     retry_resp = resp
                 rej.append(_rej("G12", key, f"extraction failed: {resp.error.message if resp.error else ''}"))
@@ -649,9 +716,11 @@ class ResearchGraph:
             sc.extractions.append((key, resp.payload))
         if retry_resp is not None:  # cached chunk results are served from the response cache when the task is re-run
             return {"errors": [*errors, "extraction: transient failure, task will be retried"], "route": "defer_retry",
-                    "retry_after_s": retry_resp.error.retry_after_s, "retry_reason": "EXTRACTION_RETRY_PENDING"}
+                    "retry_after_s": retry_resp.error.retry_after_s, "retry_reason": "EXTRACTION_RETRY_PENDING",
+                    "rate_limited": retry_resp.error.rate_limited}
         route = "gate_extraction" if sc.extractions else "mark_terminal"
-        upd: dict[str, Any] = {"errors": errors, "rejections": rej, "partial": partial, "route": route}
+        upd: dict[str, Any] = {"errors": errors, "rejections": rej, "partial": partial, "route": route,
+                               "transient_incomplete": transient}
         if not sc.extractions:
             upd["terminal_reason"] = "NO_USABLE_EXTRACTION"
         if partial and not sc.extractions:
@@ -918,7 +987,7 @@ class ResearchGraph:
         t, sc = s.task, self.sc(s)
         new = [c for c in s.cands if not c.dropped]
         parent = self.card(t.entity_id, t.entity_name)
-        unavailable, errors = False, []
+        unavailable, errors, transient = False, [], False
         for i in range(0, len(new), REL_BATCH):
             batch = new[i : i + REL_BATCH]
             pages: dict[int, PageExcerpt] = {}
@@ -960,11 +1029,13 @@ class ResearchGraph:
                 if self.should_retry_later(s, resp):  # keep the candidates, retry the verification later
                     return {"errors": [*errors, "relationship: transient failure, task will be retried"],
                             "route": "defer_retry", "retry_after_s": resp.error.retry_after_s,
-                            "retry_reason": "VERIFICATION_RETRY_PENDING"}
+                            "retry_reason": "VERIFICATION_RETRY_PENDING", "rate_limited": resp.error.rate_limited}
                 unavailable = True
+                transient = transient or bool(resp.error is not None and resp.error.retryable)
                 for c in batch:
                     c.rel_unavailable = True
-        return {"cands": s.cands, "errors": errors, "rel_unavailable": unavailable, "route": "verify_and_score"}
+        return {"cands": s.cands, "errors": errors, "rel_unavailable": unavailable, "route": "verify_and_score",
+                "transient_incomplete": s.transient_incomplete or transient}
 
     def n_verify_and_score(self, s: ResearchState) -> dict[str, Any]:
         d, sc, st = self.d, self.sc(s), self.d.settings

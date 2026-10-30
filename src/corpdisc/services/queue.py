@@ -142,15 +142,33 @@ class QueueService:
         """Mark DONE. ``note`` (e.g. ``PARTIAL:VERIFICATION_UNAVAILABLE``) records that work finished with gaps."""
         self._finish(task_id, QueueStatus.DONE, note[:500] if note else None, crawl_state)
 
-    def reschedule(self, task_id: int, not_before: datetime, error: str) -> None:
+    def reschedule(self, task_id: int, not_before: datetime, error: str, *, consume_attempt: bool = True) -> None:
         """Retry later: back to PENDING with a future ``not_before``. Unlike ``defer``, ``attempts`` is kept so the
-        retry cap is enforced; the failure reason stays visible in ``error``."""
+        retry cap is enforced; the failure reason stays visible in ``error``. ``consume_attempt=False`` gives the attempt
+        back (an HTTP 429 means no work was done), like ``defer``."""
         with self._tx():
             self._conn.execute(
-                "UPDATE research_queue SET status = 'PENDING', not_before = ?, finished_at = NULL, error = ? "
+                "UPDATE research_queue SET status = 'PENDING', not_before = ?, finished_at = NULL, error = ?, "
+                "attempts = CASE WHEN ? THEN attempts ELSE MAX(attempts - 1, 0) END "
                 "WHERE task_id = ? AND status = 'RUNNING'",
-                (iso_utc(not_before), error[:500], task_id),
+                (iso_utc(not_before), error[:500], int(consume_attempt), task_id),
             )
+
+    RETRYABLE_PARTIAL_PREFIX: Final = "PARTIAL:RETRYABLE:"
+
+    def requeue_retryable_partials(self, run_id: int) -> int:
+        """Put DONE tasks that finished with a transient provider gap (``PARTIAL:RETRYABLE:``) back to PENDING with a fresh
+        attempt budget, so a resume redoes the missing part. Returns the number of tasks requeued."""
+        with self._tx():
+            rows = self._conn.execute(
+                "SELECT task_id, entity_id FROM research_queue WHERE run_id = ? AND status = 'DONE' AND error LIKE ?",
+                (run_id, self.RETRYABLE_PARTIAL_PREFIX + "%")).fetchall()
+            for r in rows:
+                self._conn.execute(
+                    "UPDATE research_queue SET status = 'PENDING', attempts = 0, not_before = NULL, finished_at = NULL, "
+                    "error = 'REQUEUED:' || COALESCE(error, '') WHERE task_id = ?", (r["task_id"],))
+                self._conn.execute("UPDATE entities SET crawl_state = 'PENDING' WHERE entity_id = ?", (r["entity_id"],))
+            return len(rows)
 
     def next_ready_time(self, run_id: int) -> datetime | None:
         """Earliest ``not_before`` among PENDING tasks (None when nothing is waiting)."""
@@ -169,7 +187,9 @@ class QueueService:
                             "AND not_before > ?", (run_id, iso_utc(self._clock.now()))).fetchone()[0]
         clean = c.execute("SELECT COUNT(*) FROM research_queue WHERE run_id=? AND status='DONE' "
                           "AND (error IS NULL OR error NOT LIKE 'PARTIAL:%')", (run_id,)).fetchone()[0]
-        return {"failed": failed, "partial": partial, "waiting": waiting, "done_clean": clean}
+        retryable = c.execute("SELECT COUNT(*) FROM research_queue WHERE run_id=? AND status='DONE' AND error LIKE ?",
+                              (run_id, self.RETRYABLE_PARTIAL_PREFIX + "%")).fetchone()[0]
+        return {"failed": failed, "partial": partial, "waiting": waiting, "done_clean": clean, "retryable_partial": retryable}
 
     def skip(self, task_id: int, reason: str, crawl_state: CrawlState | None = CrawlState.SKIPPED) -> None:
         self._finish(task_id, QueueStatus.SKIPPED, reason[:500], crawl_state)

@@ -180,6 +180,7 @@ class GatewayFailure:
     auth: bool = False
     retryable: bool = False  # transient: the same work may succeed later (429, timeout, 5xx)
     retry_after_s: float | None = None
+    rate_limited: bool = False  # HTTP 429 (not an outage): no model work was done
 
 
 @dataclass(frozen=True)
@@ -266,7 +267,7 @@ class LLMGateway:
                         log.warning("rate limited: Retry-After %.0fs exceeds the %.0fs ceiling; deferring the work",
                                     exc.retry_after_s, self.policy.retry_after_ceiling)
                         return GatewayResult(None, GatewayFailure(FailureKind.TRANSPORT, str(exc)[:300], retryable=True,
-                                                                  retry_after_s=exc.retry_after_s),
+                                                                  retry_after_s=exc.retry_after_s, rate_limited=True),
                                              used - rl_used, ms(), tuple(errors))
                     if rl_used <= self.policy.rate_limit_retries:
                         log.info("rate limited (429): sleeping %.1fs before retry %d/%d", wait_s, rl_used,
@@ -274,7 +275,8 @@ class LLMGateway:
                         self._sleeper.sleep(wait_s)
                         continue
                     return GatewayResult(None, GatewayFailure(FailureKind.TRANSPORT, f"rate limited: {str(exc)[:250]}",
-                                                              retryable=True, retry_after_s=exc.retry_after_s),
+                                                              retryable=True, retry_after_s=exc.retry_after_s,
+                                                              rate_limited=True),
                                          used - rl_used, ms(), tuple(errors))
                 if exc.retryable and used - rl_used <= self.policy.transport_retries and used - rl_used < max_requests:
                     self._sleeper.sleep(min(self._backoff(used - rl_used - 1, exc.retry_after_s), self.policy.retry_after_ceiling))

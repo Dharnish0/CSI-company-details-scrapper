@@ -81,6 +81,7 @@ class Supervisor:
         self.sleeper = sleeper or (deps.clock if isinstance(deps.clock, Sleeper) else None)
         self.research = ResearchGraph(deps)
         self.finalize_graph = FinalizeGraph(deps)
+        self._rl_deferrals: dict[int, int] = {}  # task_id -> free (attempt-neutral) 429 deferrals used in this process
 
     # ------------------------------------------------------------------ seeding
     def seed_root(self) -> int | None:
@@ -172,9 +173,18 @@ class Supervisor:
                 summary.stopped_reason = "CIRCUIT_OPEN"
                 return self._stop(summary, RunStatus.PAUSED, run_finalize=False)
             if result.outcome == "RETRY_LATER":
-                delay = max(result.retry_after_s or 0.0, d.settings.queue_retry_base_seconds * 2 ** (task.attempts - 1))
-                reason = f"{result.retry_reason or 'RETRY_PENDING'} (attempt {task.attempts}/{d.queue.max_attempts})"
-                d.queue.reschedule(task.task_id, d.clock.now() + timedelta(seconds=delay), reason)
+                # an HTTP 429 did no model work: wait without using up an attempt, but only a bounded number of times
+                # per task and process, so a provider that never recovers still ends in the attempt-consuming path
+                used = self._rl_deferrals.get(task.task_id, 0)
+                free = result.rate_limited and used < d.settings.queue_max_rate_limit_deferrals
+                if free:
+                    self._rl_deferrals[task.task_id] = used + 1
+                delay = max(result.retry_after_s or 0.0, d.settings.queue_retry_base_seconds
+                            * 2 ** (min(used, 4) if free else task.attempts - 1))
+                reason = (f"{result.retry_reason or 'RETRY_PENDING'} (attempt {task.attempts}/{d.queue.max_attempts}"
+                          + (f", rate limited, deferral {used + 1}/{d.settings.queue_max_rate_limit_deferrals})" if free else ")"))
+                d.queue.reschedule(task.task_id, d.clock.now() + timedelta(seconds=delay), reason,
+                                   consume_attempt=not free)
                 log.warning("task %s rescheduled in %.0fs: %s", task.task_id, delay, reason)
                 summary.outcomes["RETRY"] += 1
                 summary.retries += 1
@@ -194,7 +204,8 @@ class Supervisor:
             q.skip(task_id, (result.errors[-1] if result.errors else "skipped")[:300], CrawlState.SKIPPED)
         elif result.outcome == "PARTIAL":  # finished with gaps (e.g. verification unavailable after the retry cap)
             note = (result.errors[-1] if result.errors else "INCOMPLETE")[:200]
-            q.complete(task_id, OUTCOME_TO_STATE["PARTIAL"], note=f"{q.PARTIAL_PREFIX}{note}")
+            prefix = q.RETRYABLE_PARTIAL_PREFIX if result.transient_incomplete else q.PARTIAL_PREFIX
+            q.complete(task_id, OUTCOME_TO_STATE["PARTIAL"], note=f"{prefix}{note}")
         elif result.outcome in ("TERMINAL", "UNREACHABLE", "NO_WEBSITE"):  # never a terminal state without a reason
             q.complete(task_id, OUTCOME_TO_STATE[result.outcome], note=f"{result.outcome}:{result.reason}"[:500])
         else:
@@ -229,4 +240,7 @@ class Supervisor:
     def resume(self, *, max_tasks: int | None = None) -> RunSummary:
         """Close the breaker with one probe (25.4) and continue from the queue state."""
         self.d.runner.gateway.breaker.half_open()
+        n = self.d.queue.requeue_retryable_partials(self.d.run_id)  # finished with a transient gap: redo the missing part
+        if n:
+            log.info("resume: %d task(s) with a transient provider gap requeued", n)
         return self.run(max_tasks=max_tasks)

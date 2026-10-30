@@ -92,10 +92,11 @@ class AgentRunner:
 
     @staticmethod
     def _fail(meta: Meta, status: CallStatus, kind: FailureKind, msg: str, usage: Usage, *, retryable: bool = False,
-              retry_after_s: float | None = None) -> AgentResponse:
+              retry_after_s: float | None = None, truncated: bool = False, rate_limited: bool = False) -> AgentResponse:
         return AgentResponse(meta=meta, status=status, payload=None, usage=usage,
                              error=AgentError(kind=kind, message=msg[:500], retryable=retryable,
-                                              retry_after_s=retry_after_s))
+                                              retry_after_s=retry_after_s, truncated=truncated,
+                                              rate_limited=rate_limited))
 
     # ------------------------------------------------------------------ invoke
     def invoke(self, agent: BaseAgent, request: AgentRequest, *, feedback: str | None = None) -> AgentResponse:
@@ -211,7 +212,8 @@ class AgentRunner:
                 return self._fail(meta, CallStatus.FAILED, fk, res.failure.message if res.failure else "no response",
                                   Usage(tokens_in=t_in, tokens_out=t_out, cost_usd=cost, latency_ms=latency),
                                   retryable=bool(res.failure and res.failure.retryable),
-                                  retry_after_s=res.failure.retry_after_s if res.failure else None)
+                                  retry_after_s=res.failure.retry_after_s if res.failure else None,
+                                  rate_limited=bool(res.failure and res.failure.rate_limited))
             r = res.response
             diag = {"finish_reason": r.finish_reason, "provider_metrics": dict(r.metrics)}
             t_in, t_out, cost = t_in + r.usage.tokens_in, t_out + r.usage.tokens_out, cost + r.usage.cost_usd
@@ -252,7 +254,7 @@ class AgentRunner:
                     continue
                 return self._fail(meta, CallStatus.FAILED, FailureKind.SCHEMA, err,
                                   Usage(tokens_in=t_in, tokens_out=t_out, cost_usd=cost, latency_ms=latency,
-                                        tool_calls=tool_calls))
+                                        tool_calls=tool_calls), truncated=truncated)
             self._finish(inv, CallStatus.OK, None, {"payload": out.model_dump(mode="json"), "model": r.model,
                          "provider": self._gw.provider_name, "transport": transport, **diag}, tokens=tok,
                          cost=r.usage.cost_usd, latency=res.latency_ms)

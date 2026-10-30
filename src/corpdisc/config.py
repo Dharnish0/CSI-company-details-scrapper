@@ -106,6 +106,7 @@ class Settings(BaseSettings):
     queue_max_attempts: int = Field(default=3, ge=1)
     queue_retry_base_seconds: float = Field(default=60.0, ge=0)  # backoff = base * 2**(attempt-1), or Retry-After if larger
     queue_retry_wait_max_seconds: float = Field(default=300.0, ge=0)  # longer waits pause the run (resumable)
+    queue_max_rate_limit_deferrals: int = Field(default=6, ge=0)  # HTTP 429 waits per task that keep the attempt (0 = off)
     llm_cassette_dir: Path = Path("./.cache/llm_cassettes")
     # M8 real providers
     llm_timeout_seconds: float = Field(default=300.0, gt=0)

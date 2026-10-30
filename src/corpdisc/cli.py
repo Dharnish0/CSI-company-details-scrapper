@@ -168,7 +168,8 @@ def _print_summary(rt, summary) -> None:  # type: ignore[no-untyped-def]
     print(f"Run {rt.run_id}: {label} ({summary.stopped_reason}); {summary.processed} tasks, "
           f"outcomes={dict(summary.outcomes)}, failed={summary.failed_tasks}, retries={summary.retries}")
     if d:
-        print(f"Queue: failed={d.get('failed', 0)} done_with_gaps={d.get('partial', 0)} waiting_retry={d.get('waiting', 0)}")
+        print(f"Queue: failed={d.get('failed', 0)} done_with_gaps={d.get('partial', 0)} waiting_retry={d.get('waiting', 0)} "
+          f"retryable_gaps={d.get('retryable_partial', 0)}")
     fin = summary.finalize
     if fin is not None:
         print(f"Finalize: {fin.outcome}; confirmed={fin.confirmed} review={fin.review_required} merges={fin.merges} "

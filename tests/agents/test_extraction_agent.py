@@ -256,3 +256,17 @@ def test_persistent_hallucination_creates_no_entity_and_is_logged(tmp_path):
     w.sup.run(max_tasks=1)
     assert "Ghost Industries" not in w.names()
     assert w.q("SELECT 1 FROM gate_rejections WHERE gate_code='G2' AND item_ref='Ghost Industries'")
+
+
+def test_length_truncation_sets_truncated_flag_and_is_not_repaired(tmp_path):
+    """finish_reason=length marks the failure ``truncated`` (so the caller re-chunks) and never sends a repair request."""
+    from corpdisc.agents.ports import ProviderResponse
+    cut = ProviderResponse(content='{"entities": [{"local_ref": "e1", "name": "Aur', model="m", finish_reason="length")
+    s = build(tmp_path, [cut, output()])
+    r = s.runner.invoke(AGENT, _req(s))
+    assert r.status is CallStatus.FAILED and r.error.kind is FailureKind.SCHEMA
+    assert r.error.truncated is True and r.error.retryable is False
+    assert s.provider.call_count == 1  # no repair re-ask
+    ok = build(tmp_path / "b", ["{not json", output()])
+    r2 = ok.runner.invoke(AGENT, _req(ok))
+    assert r2.status is CallStatus.OK  # an ordinary schema error is still repaired once
