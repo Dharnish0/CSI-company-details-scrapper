@@ -88,6 +88,11 @@ class CommitRejectedError(RuntimeError):
         super().__init__(f"commit rejected: {failed_invariant}: {message}")
         self.failed_invariant = failed_invariant
 
+class CommitPlanInvalidError(RuntimeError):
+    """The commit plan built by ``n_commit`` failed validation. The extracted candidates were saved for review first;
+    the error is generic, so the supervisor retries the task (bounded by the queue's attempt cap) and records the text."""
+
+
 HIGH_BAND: Final = 0.60  # at or above: straight to the gate
 LOW_BAND: Final = 0.20  # at or below: nothing relevant
 EXTRACT_MIN_CONF: Final = 0.35
@@ -1112,12 +1117,20 @@ class ResearchGraph:
         parent_ref = EntityRef(entity_id=t.entity_id)
         entities, websites, rels, evs, aliases, cands_w, reviews = [], [], [], [], [], [], []
         rows = list(s.cand_rows)
+        extra_rej: list[dict[str, Any]] = []
         known_done: set[int] = set()
+        # refs that become an EntityWrite below (same conditions as the entity branch): an alias may only point at these
+        stored_refs = {c.ref for c in s.cands if not c.dropped and c.status is not None
+                       and c.status != VerificationStatus.REJECTED.value}
         for c in s.cands:
             ch = sc.chunks[c.chunk_key]
             if c.dropped == "duplicate_in_batch":
-                aliases.append(AliasWrite(entity=EntityRef(local_ref=c.duplicate_of), alias=c.name[:300],
-                                          normalized_alias=c.norm, source_page_id=c.page_id))
+                if c.duplicate_of in stored_refs:
+                    aliases.append(AliasWrite(entity=EntityRef(local_ref=c.duplicate_of), alias=c.name[:300],
+                                              normalized_alias=c.norm, source_page_id=c.page_id))
+                else:  # the surviving candidate was not stored (rejected or never verified): so is this alias of it
+                    why = f"{c.name!r} is a duplicate reference to {c.duplicate_of}, which was not stored"
+                    extra_rej.append(_rej("G8", c.name, f"ALIAS_TARGET_NOT_STORED: {why}"))  # its DUPLICATE row stays
                 continue
             if c.dropped == "known_sibling":
                 continue  # reviewed, never stored as an edge (the candidate row and review item were queued earlier)
@@ -1210,10 +1223,15 @@ class ResearchGraph:
                 source_page_id=r["page_id"], parent=parent_ref, raw_name=r["name"], normalized_name=r["norm"],
                 candidate_kind=CandidateKind(r["kind"]), proposed_type=EntityType(r["ptype"]) if r["ptype"] else None,
                 decision=r["decision"], resolved=res, reason=r["reason"], confidence=r["conf"], gate_code=r["gate"]))
-        plan = CommitPlan(
-            run_id=t.run_id, task_id=t.task_id, candidates=tuple(_dedup_candidates(cands_w)), entities=tuple(entities),
-            websites=tuple(websites), relationships=tuple(rels), evidence=tuple(evs), aliases=tuple(aliases),
-            review_items=tuple(reviews), gate_rejections=tuple(GateRejectionWrite(**{k: v for k, v in r.items()}) for r in s.rejections))
+        try:
+            plan = CommitPlan(
+                run_id=t.run_id, task_id=t.task_id, candidates=tuple(_dedup_candidates(cands_w)), entities=tuple(entities),
+                websites=tuple(websites), relationships=tuple(rels), evidence=tuple(evs), aliases=tuple(aliases),
+                review_items=tuple(reviews),
+                gate_rejections=tuple(GateRejectionWrite(**{k: v for k, v in r.items()}) for r in [*s.rejections, *extra_rej]))
+        except ValueError as exc:  # pydantic.ValidationError: an internally inconsistent plan is a bug, never lost work
+            self._keep_candidates_after_invalid_plan(s, cands_w, exc)
+            raise CommitPlanInvalidError(str(exc)) from exc
         res = d.committer.commit(plan)
         if isinstance(res, CommitRejected):
             d.pages_repo.add_crawl_error(t.run_id, "REGISTRY", res.failed_invariant, res.message, entity_id=t.entity_id)
@@ -1255,6 +1273,22 @@ class ResearchGraph:
         if updates:
             d.committer.commit(CommitPlan(run_id=t.run_id, task_id=t.task_id, entity_updates=tuple(updates)))
         return {"enqueued_task_ids": enq, "route": "finish"}
+
+    def _keep_candidates_after_invalid_plan(self, s: ResearchState, cands_w: list[CandidateWrite], exc: Exception) -> None:
+        """The full plan is invalid: still save what was extracted (candidate rows as REVIEW, no entities or edges) and
+        record the error, so the retry starts from audited candidates and nothing already paid for is lost."""
+        t, d = s.task, self.d
+        msg = f"COMMIT_PLAN_INVALID: {exc}"[:500]
+        kept = [c.model_copy(update={"resolved": None, "decision": "REVIEW" if c.decision == "ACCEPTED" else c.decision,
+                                     "reason": f"commit plan invalid, will be retried: {c.reason or ''}"[:500]})
+                for c in _dedup_candidates(cands_w)]
+        try:
+            d.committer.commit(CommitPlan(run_id=t.run_id, task_id=t.task_id, candidates=tuple(kept),
+                                          gate_rejections=(GateRejectionWrite(gate_code="G12", item_ref=f"task={t.task_id}",
+                                                                              detail=msg),)))
+        except Exception:  # noqa: BLE001 - the original validation error is the one to surface
+            log.exception("could not save candidates after an invalid commit plan (task %s)", t.task_id)
+        d.pages_repo.add_crawl_error(t.run_id, "REGISTRY", "COMMIT_PLAN_INVALID", msg, entity_id=t.entity_id)
 
     def _flush(self, s: ResearchState) -> None:
         """Persist audit rows (gate rejections, candidate decisions, review items) on terminal paths too."""
