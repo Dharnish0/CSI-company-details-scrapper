@@ -73,7 +73,7 @@ from corpdisc.models.domain import (
 )
 from corpdisc.services.confidence import ConfidenceFlag, EvidenceInput
 from corpdisc.services.dom_candidates import extract_dom_candidates
-from corpdisc.services.links import build_link_index
+from corpdisc.services.links import build_link_index, guess_page_type
 from corpdisc.services.matcher import MatchCandidate
 from corpdisc.services.normalize import normalize_name, normalize_text, registrable_domain
 from corpdisc.services.urls import canonicalize_url
@@ -94,6 +94,9 @@ EXTRACT_MIN_CONF: Final = 0.35
 DISCOVERY_MIN_RELEVANCE: Final = 0.50
 DISCOVERY_NONE_CONF: Final = 0.70
 CHUNK_CHARS: Final = 6000
+ENTRY_MIN_DOM_CANDIDATES: Final = 3  # a start page without a listing URL needs this many company-like candidates
+_LISTING_TYPES: Final = frozenset({PageType.COMPANIES, PageType.PORTFOLIO, PageType.BRANDS, PageType.SUBSIDIARIES,
+                                 PageType.OPERATING_GROUPS})
 MAX_CHUNKS_PER_PAGE: Final = 6
 REL_BATCH: Final = 15
 WINDOW: Final = 1500
@@ -185,6 +188,7 @@ class ResearchState(BaseModel):
     rel_unavailable: bool = False
     retry_after_s: float | None = None
     retry_reason: str = ""
+    terminal_reason: str = ""  # why a TERMINAL/UNREACHABLE/NO_WEBSITE task ended without extracting (never left empty)
     outcome: Outcome | None = None
     budget_scope: Literal["task", "run"] | None = None
     ref_ids: dict[str, int] = Field(default_factory=dict)
@@ -205,12 +209,15 @@ class ResearchResult:
     gate_rejections: int
     retry_after_s: float | None = None
     retry_reason: str = ""
+    reason: str = ""
 
 
 @dataclass
 class Scratch:
     html: str = ""
     base_url: str = ""
+    entry_canonical: str = ""
+    use_entry: bool = False
     link_index: Any = None
     page_indexes: dict[int, Any] = None  # type: ignore[assignment]
     chunks: dict[str, dict[str, Any]] = None  # type: ignore[assignment]
@@ -316,7 +323,16 @@ class ResearchGraph:
         st = final if isinstance(final, ResearchState) else ResearchState(**final)
         return ResearchResult(st.outcome or "TERMINAL", tuple(st.committed_ids), tuple(st.enqueued_task_ids),
                               tuple(st.errors), st.budget_scope, len(st.rejections),
-                              st.retry_after_s, st.retry_reason)
+                              st.retry_after_s, st.retry_reason, self._reason(st))
+
+    @staticmethod
+    def _reason(st: ResearchState) -> str:
+        """Every TERMINAL / UNREACHABLE / NO_WEBSITE outcome carries a reason; an unset one is named, not blank."""
+        outcome = st.outcome or "TERMINAL"
+        if outcome not in ("TERMINAL", "UNREACHABLE", "NO_WEBSITE"):
+            return st.terminal_reason
+        return st.terminal_reason or {"TERMINAL": "NO_NEW_ENTITIES", "UNREACHABLE": "FETCH_FAILED",
+                                      "NO_WEBSITE": "NO_START_URL"}[outcome]
 
     # --------------------------------------------------------------- helpers
     def sc(self, s: ResearchState) -> Scratch:
@@ -399,7 +415,8 @@ class ResearchGraph:
                                  "WHERE e.entity_id=?", (t.entity_id,)).fetchone()
             url = row[0] if row else None
         if not url:
-            return {"outcome": "NO_WEBSITE", "route": "finish", "errors": ["no start url or primary website"]}
+            return {"outcome": "NO_WEBSITE", "route": "finish", "errors": ["no start url or primary website"],
+                    "terminal_reason": "NO_START_URL"}
         r = d.fetch.fetch(url, run_id=t.run_id, entity_id=t.entity_id, parent_entity_id=t.parent_entity_id,
                           page_type=PageType.HOME)
         if (r.error_code or "").startswith("BUDGET_"):
@@ -407,12 +424,15 @@ class ResearchGraph:
             return self.stop(r.error_code or "BUDGET", "run" if run_wide else "task")
         gate = check_g6_reachability(SimpleNamespace(status=r.crawl_status.value, text=r.text, error=r.error))
         if not gate.allowed:
-            return {"route": "mark_unreachable", "errors": [f"G6 {gate.detail}"],
+            return {"route": "mark_unreachable", "errors": [f"G6 {gate.detail}"], "terminal_reason": "ENTRY_FETCH_FAILED",
                     "rejections": [_rej("G6", url, gate.detail or "unreachable")]}
         sc = self.sc(s)
         sc.html = r.html or (d.fetch.load_html(r.page_id) if r.page_id else None) or ""
         sc.base_url = r.final_url or r.canonical_url or url
+        sc.entry_canonical = r.canonical_url or ""
         sc.parent_regs.add(registrable_domain(sc.base_url) or "")
+        if r.page_id:  # the parent's website check fetched this page without an owner: it now belongs to this entity
+            d.pages_repo.attribute_page(r.page_id, t.entity_id)
         return {"entry_page_id": r.page_id, "page_ids": [r.page_id], "route": "index_links"}
 
     def n_index_links(self, s: ResearchState) -> dict[str, Any]:
@@ -420,7 +440,24 @@ class ResearchGraph:
         sc.link_index = build_link_index(sc.html, sc.base_url)
         if s.entry_page_id:
             self.d.pages_repo.set_counts(s.entry_page_id, pages_found=len(sc.link_index.links))
+            sc.use_entry = self._entry_usable(s, sc)
         return {"route": "route_discovery"}
+
+    def _entry_usable(self, s: ResearchState, sc: Scratch) -> bool:
+        """The entity's own start page is itself a listing of companies: by its URL, or by ownership wording plus
+        several company-like DOM candidates. Only then is it chunked and extracted like any approved page."""
+        if guess_page_type(sc.base_url) in _LISTING_TYPES:
+            return True
+        text = self.d.fetch.load_text(s.entry_page_id) or ""
+        if not _OWNERSHIP_WORDING.search(text):
+            return False
+        return len(extract_dom_candidates(sc.html, sc.link_index)) >= ENTRY_MIN_DOM_CANDIDATES
+
+    def _no_pages(self, s: ResearchState, reason: str) -> dict[str, Any]:
+        """No extra page to read: extract the (listing-like) start page itself, or end TERMINAL with the reason."""
+        if self.sc(s).use_entry:
+            return {"route": "build_extraction_inputs"}
+        return {"route": "mark_terminal", "terminal_reason": reason}
 
     def n_route_discovery(self, s: ResearchState) -> dict[str, Any]:
         idx = self.sc(s).link_index
@@ -432,7 +469,7 @@ class ResearchGraph:
             return {"selections": sel, "route": "gate_pages"}
         if any(LOW_BAND < lk.det_score < HIGH_BAND for lk in same):
             return {"route": "discovery_agent"}
-        return {"route": "mark_terminal"}
+        return self._no_pages(s, "NO_LISTING_LINKS")
 
     def _fallback_selection(self, idx: Any) -> list[dict[str, Any]]:
         pool = [lk for lk in idx.top(self.max_links(), min_score=LOW_BAND + 1e-9, same_domain_only=True)]
@@ -455,7 +492,7 @@ class ResearchGraph:
         if resp.status is CallStatus.OK and resp.payload is not None:
             o = resp.payload
             if o.no_relevant_pages and o.agent_confidence >= DISCOVERY_NONE_CONF:
-                return {**out, "route": "mark_terminal"}
+                return {**out, **self._no_pages(s, "DISCOVERY_NONE")}
             for p in o.selections:
                 g1 = check_g1_id_integrity(str(p.link_id), idx.ids)
                 if not g1.allowed:
@@ -469,7 +506,11 @@ class ResearchGraph:
 
     def n_gate_pages(self, s: ResearchState) -> dict[str, Any]:
         sc, d = self.sc(s), self.d
-        idx, seen, approved, rej = sc.link_index, {sc.base_url}, [], []
+        # the entity's own start page is already visited: seed every spelling of it (raw, canonical, fetch-canonical)
+        idx, approved, rej = sc.link_index, [], []
+        seen = {sc.base_url, canonicalize_url(sc.base_url).canonical or sc.base_url}
+        if sc.entry_canonical:
+            seen.add(sc.entry_canonical)
         for p in s.selections:
             ref = f"link_id={p['link_id']}"
             if not (g := check_g1_id_integrity(str(p["link_id"]), idx.ids)).allowed:
@@ -494,7 +535,7 @@ class ResearchGraph:
             approved.append({"link_id": lk.link_id, "url": lk.url, "page_type": p["page_type"]})
         approved = approved[: self.max_links()]
         if not approved:
-            return {"rejections": rej, "route": "mark_terminal"}
+            return {"rejections": rej, **self._no_pages(s, "NO_PAGES_APPROVED")}
         return {"approved": approved, "rejections": rej, "route": "fetch_pages"}
 
     def n_fetch_pages(self, s: ResearchState) -> dict[str, Any]:
@@ -514,19 +555,24 @@ class ResearchGraph:
             if not check_g6_reachability(SimpleNamespace(status=r.crawl_status.value, text=r.text, error=r.error)).allowed:
                 rej.append(_rej("G6", a["url"], r.error or r.error_code or "fetch failed"))
                 continue
-            ids.append(r.page_id)
+            if r.page_id not in ids:  # the start page comes back from the visited cache: never listed twice
+                ids.append(r.page_id)
         fetched = [i for i in ids if i != s.entry_page_id]
         if not fetched:
             if budget_hits:
                 return {**self.stop("page budget exhausted", "run" if run_stop else "task"), "rejections": rej}
-            return {"rejections": rej, "route": "mark_unreachable"}
+            if self.sc(s).use_entry:
+                return {"page_ids": ids, "rejections": rej, "route": "build_extraction_inputs"}
+            if rej:  # at least one approved page was really requested and failed
+                return {"rejections": rej, "route": "mark_unreachable", "terminal_reason": "ALL_APPROVED_FETCHES_FAILED"}
+            return {"rejections": rej, "route": "mark_terminal", "terminal_reason": "NO_PAGES_FETCHED"}
         return {"page_ids": ids, "rejections": rej, "route": "build_extraction_inputs"}
 
     def n_build_extraction_inputs(self, s: ResearchState) -> dict[str, Any]:
         sc, d = self.sc(s), self.d
         approved = {a["url"]: a for a in s.approved}
         for pid in s.page_ids:
-            if pid == s.entry_page_id:
+            if pid == s.entry_page_id and not sc.use_entry:
                 continue
             row = d.pages_repo.get_page_by_id(pid)
             text, html = d.fetch.load_text(pid), d.fetch.load_html(pid)
@@ -557,7 +603,9 @@ class ResearchGraph:
                     "dom": cdom, "link_ids": {lk.link_id for lk in links}, "links": idx.to_refs([lk.link_id for lk in links]),
                     "page_text": text, "source_class": self.source_class(s, row.canonical_url),
                 }  # fmt: skip
-        return {"route": "extraction_agent" if sc.chunks else "mark_terminal"}
+        if sc.chunks:
+            return {"route": "extraction_agent"}
+        return {"route": "mark_terminal", "terminal_reason": "NO_EXTRACTABLE_TEXT"}
 
     def _ground(self, out: ExtractionOutput, ch: dict[str, Any]) -> tuple[list[tuple[Any, str]], list[Any]]:
         """G1/G2/G3 for one chunk output (shared pure implementation in graphs.grounding)."""
@@ -604,6 +652,8 @@ class ResearchGraph:
                     "retry_after_s": retry_resp.error.retry_after_s, "retry_reason": "EXTRACTION_RETRY_PENDING"}
         route = "gate_extraction" if sc.extractions else "mark_terminal"
         upd: dict[str, Any] = {"errors": errors, "rejections": rej, "partial": partial, "route": route}
+        if not sc.extractions:
+            upd["terminal_reason"] = "NO_USABLE_EXTRACTION"
         if partial and not sc.extractions:
             upd["outcome"] = "PARTIAL"
         return upd
@@ -652,6 +702,8 @@ class ResearchGraph:
                     country=e.country, industry=e.industry, ext_conf=e.agent_confidence, claim=ev, sibling=sibling))
         upd: dict[str, Any] = {"cands": cands, "cand_rows": rows, "rejections": rej}
         upd["route"] = "match_known" if cands else "mark_terminal"
+        if not cands:
+            upd["terminal_reason"] = "NO_CANDIDATES"
         if not cands and s.partial:
             upd["outcome"] = "PARTIAL"
         return upd

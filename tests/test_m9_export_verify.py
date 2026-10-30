@@ -212,3 +212,12 @@ def test_cli_verify_exits_nonzero_on_a_defect(done, monkeypatch, capsys):
     done.conn.commit()
     assert main(["verify"]) == 1
     assert "FAIL" in capsys.readouterr().out
+
+def test_verify_flags_terminal_without_reason(done):
+    """A TERMINAL/UNREACHABLE entity whose finished task recorded no reason is surfaced (WARN), never silent."""
+    assert not [c for c in verify(done) if "without a recorded reason" in c.name and c.status != "PASS"]
+    done.conn.execute("UPDATE entities SET crawl_state='TERMINAL' WHERE name='Group A'")
+    done.conn.execute("UPDATE research_queue SET error=NULL WHERE entity_id=(SELECT entity_id FROM entities WHERE name='Group A')")
+    done.conn.commit()
+    hit = [c for c in verify(done) if "without a recorded reason" in c.name]
+    assert hit and hit[0].status == "WARN" and "Group A" in hit[0].detail

@@ -195,6 +195,8 @@ class Supervisor:
         elif result.outcome == "PARTIAL":  # finished with gaps (e.g. verification unavailable after the retry cap)
             note = (result.errors[-1] if result.errors else "INCOMPLETE")[:200]
             q.complete(task_id, OUTCOME_TO_STATE["PARTIAL"], note=f"{q.PARTIAL_PREFIX}{note}")
+        elif result.outcome in ("TERMINAL", "UNREACHABLE", "NO_WEBSITE"):  # never a terminal state without a reason
+            q.complete(task_id, OUTCOME_TO_STATE[result.outcome], note=f"{result.outcome}:{result.reason}"[:500])
         else:
             q.complete(task_id, OUTCOME_TO_STATE.get(result.outcome, CrawlState.TERMINAL))
 

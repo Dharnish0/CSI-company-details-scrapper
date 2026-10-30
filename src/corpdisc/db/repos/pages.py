@@ -159,6 +159,12 @@ class PageRepo:
                     "UPDATE crawl_pages SET entities_found = ? WHERE page_id = ?", (entities_found, page_id)
                 )
 
+    def attribute_page(self, page_id: int, entity_id: int) -> None:
+        """Give an unattributed page (fetched by a parent's website check) to the entity whose task now uses it."""
+        with self._conn:
+            self._conn.execute("UPDATE crawl_pages SET entity_id = ? WHERE page_id = ? AND entity_id IS NULL",
+                               (entity_id, page_id))
+
     def count_budgeted_pages(self, run_id: int, domain: str | None = None) -> int:
         marks = ",".join("?" for _ in UNBUDGETED_STATUSES)
         sql = f"SELECT COUNT(*) FROM crawl_pages WHERE run_id = ? AND crawl_status NOT IN ({marks})"  # noqa: S608

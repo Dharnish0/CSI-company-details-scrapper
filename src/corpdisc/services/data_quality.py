@@ -111,6 +111,11 @@ def check_run(conn: sqlite3.Connection, run_id: int, *, committer: Committer, cy
         [f"{r['name']!r}: {r['reason_code']}" for r in q(
             "SELECT e.name, r.reason_code FROM review_items r JOIN entities e ON e.entity_id=r.entity_id WHERE e.run_id=? AND e.verification_status='CONFIRMED' "
             "AND r.reason_code IN ('CONTRADICTION','CYCLE','NO_QUOTE','THIRD_PARTY_ONLY','NO_WEBSITE','BROKEN_SITE','VERIFICATION_UNAVAILABLE')", run_id)], warn=True)
+    add("no TERMINAL/UNREACHABLE entity without a recorded reason",
+        [f"{r['name']!r} ({r['crawl_state']})" for r in q(
+            "SELECT e.name, e.crawl_state FROM entities e JOIN research_queue t ON t.entity_id=e.entity_id "
+            "WHERE e.run_id=? AND e.merged_into_id IS NULL AND e.crawl_state IN ('TERMINAL','UNREACHABLE') "
+            "AND t.status='DONE' AND COALESCE(t.error,'')=''", run_id)], warn=True)
     add("Committer invariants INV1-INV6 hold for the whole run", [f"{v.code}: {v.message}" for v in committer.check_invariants(None)])
     return out
 
