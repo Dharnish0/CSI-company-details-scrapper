@@ -12,6 +12,7 @@ import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Annotated, Any, Final, Literal
+from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 from langgraph.graph import END, StateGraph
@@ -73,9 +74,9 @@ from corpdisc.models.domain import (
 )
 from corpdisc.services.confidence import ConfidenceFlag, EvidenceInput
 from corpdisc.services.dom_candidates import extract_dom_candidates
-from corpdisc.services.links import build_link_index, guess_page_type
+from corpdisc.services.links import build_link_index, guess_page_type, with_text_urls
 from corpdisc.services.matcher import MatchCandidate
-from corpdisc.services.normalize import normalize_name, normalize_text, registrable_domain
+from corpdisc.services.normalize import normalize_domain, normalize_name, normalize_text, registrable_domain
 from corpdisc.services.urls import canonicalize_url
 
 log = get_logger("graphs.research")
@@ -103,6 +104,7 @@ ENTRY_MIN_DOM_CANDIDATES: Final = 3  # a start page without a listing URL needs 
 _LISTING_TYPES: Final = frozenset({PageType.COMPANIES, PageType.PORTFOLIO, PageType.BRANDS, PageType.SUBSIDIARIES,
                                  PageType.OPERATING_GROUPS})
 MAX_CHUNKS_PER_PAGE: Final = 6
+TEXT_URL_NEAR_CHARS: Final = 300  # a URL printed this close after a name (and before the next name) is that name's website
 # Output-limit awareness. The extraction agent caps output at 3000 tokens (hard cap 8192) and one ExtractedEntity (name, verbatim
 # quote, reason, description) can cost 100-250 of them, so a dense chunk can outgrow the cap. A chunk that hits
 # finish_reason=length is split in halves and re-asked, up to MAX_SPLIT_DEPTH; the size that failed is remembered, and the
@@ -174,6 +176,7 @@ class Cand(BaseModel):
     site_identity: bool | None = None
     site_status: int | None = None
     child_evidence: list[VerifiedEvidence] = Field(default_factory=list)
+    near_link_ids: list[int] = Field(default_factory=list)  # URLs printed in the page text just after this candidate's name
     # verification / score
     assess: dict[str, Any] | None = None
     rel_extra: list[VerifiedEvidence] = Field(default_factory=list)
@@ -613,9 +616,10 @@ class ResearchGraph:
             if text is None:
                 continue
             idx = build_link_index(html or "", row.final_url or row.canonical_url)
-            sc.page_indexes[pid] = idx
             dom = extract_dom_candidates(html or "", idx)
             d.pages_repo.set_counts(pid, pages_found=len(idx.links), entities_found=len(dom))
+            # URLs printed in the page text become link refs too (ids after the anchors', so DOM link ids stay valid)
+            sc.page_indexes[pid] = with_text_urls(idx, text)
             ptype = PageType(row.page_type) if row.page_type in PageType._value2member_map_ else PageType.OTHER
             lines, chunks, cur, off, start = text.split("\n"), [], [], 0, 0
             for ln in lines:
@@ -905,13 +909,27 @@ class ResearchGraph:
         blocked = frozenset(d.settings.shared_platform_domains)
         parent_reg = registrable_domain(sc.base_url)
         rej, need = [], False
+        near = self._attribute_text_links(s)
         for c in s.cands:
-            if c.dropped or not c.link_url:
-                need = need or (not c.dropped)
+            if c.dropped:
                 continue
-            g5 = check_g5_platform_blocklist(c.link_url, blocked)
-            if not g5.allowed:
-                rej.append(_rej("G5", c.link_url, g5.detail or "blocklisted"))
+            if not c.link_url:
+                # a URL printed right after the name, when exactly one usable candidate exists, is the website; several
+                # go to the website agent as its closed set of choices (it can only pick a supplied link id)
+                usable = []
+                for lk in near.get(c.ref, []):
+                    if (why := self._unusable_website(sc, c, lk.url, blocked)) is not None:
+                        rej.append(_rej(*why))
+                    else:
+                        usable.append(lk)
+                c.near_link_ids = [lk.link_id for lk in near.get(c.ref, [])]
+                if len(usable) == 1:
+                    c.site_url, c.site_method, c.site_kind = usable[0].url, "TEXT_URL_NEAR_NAME", WebsiteKind.OFFICIAL.value
+                else:
+                    need = True
+                continue
+            if (why := self._unusable_website(sc, c, c.link_url, blocked)) is not None:
+                rej.append(_rej(*why))
                 need = True
                 continue
             reg = registrable_domain(c.link_url)
@@ -919,13 +937,58 @@ class ResearchGraph:
             c.site_kind = WebsiteKind.SECTION_OF_PARENT.value if reg == parent_reg else WebsiteKind.OFFICIAL.value
         return {"cands": s.cands, "rejections": rej, "route": "website_agent" if need else "gate_website"}
 
+    def _unusable_website(self, sc: Scratch, c: Cand, url: str, blocked: frozenset[str]) -> tuple[str, str, str] | None:
+        """(gate, item, detail) when ``url`` can never be this candidate's website, else None. Besides the shared-platform
+        blocklist: the page the candidate was found on, the parent's own start page and the parent's own home page are the
+        PARENT's pages. A deeper page of the parent's site stays possible, as SECTION_OF_PARENT only."""
+        g5 = check_g5_platform_blocklist(url, blocked)
+        if not g5.allowed:
+            return ("G5", url, g5.detail or "blocklisted")
+        res = canonicalize_url(url)
+        if not res.ok or res.canonical is None:
+            return ("G14", url, "website is not a usable URL")
+        own = {u for u in (canonicalize_url(x).canonical for x in (sc.base_url, sc.entry_canonical, c.page_url) if x) if u}
+        if res.canonical in own:
+            return ("G14", url, f"website of {c.name!r} is the parent's own listing page")
+        parent_hosts = {normalize_domain(x) for x in (sc.base_url, sc.entry_canonical) if x}
+        if normalize_domain(res.canonical) in parent_hosts and urlsplit(res.canonical).path in ("", "/"):
+            return ("G14", url, f"website of {c.name!r} is the parent's own home page")
+        return None
+
+    def _attribute_text_links(self, s: ResearchState) -> dict[str, list[Any]]:
+        """Text-URL links per candidate: each URL printed in the page text belongs to the candidate whose name occurs
+        nearest before it (within TEXT_URL_NEAR_CHARS). URLs on the parent's own registrable domain are never attributed."""
+        sc = self.sc(s)
+        out: dict[str, list[Any]] = {}
+        by_page: dict[int, list[Cand]] = {}
+        for c in s.cands:
+            if not c.dropped and not c.link_url:
+                by_page.setdefault(c.page_id, []).append(c)
+        for pid, cands in by_page.items():
+            idx = sc.page_indexes.get(pid)
+            links = [lk for lk in (idx.links if idx else ()) if lk.origin == "text" and lk.text_offset is not None
+                     and registrable_domain(lk.url) not in sc.parent_regs]
+            if not links:
+                continue
+            text = sc.chunks[cands[0].chunk_key]["page_text"]
+            ends = sorted((m.end(), c.ref) for c in cands for m in re.finditer(re.escape(c.name), text, re.I))
+            for lk in links:
+                before = [e for e in ends if e[0] <= lk.text_offset]  # type: ignore[operator]
+                if before and lk.text_offset - before[-1][0] <= TEXT_URL_NEAR_CHARS:  # type: ignore[operator]
+                    out.setdefault(before[-1][1], []).append(lk)
+        return out
+
     def n_website_agent(self, s: ResearchState) -> dict[str, Any]:
         t, sc, d = s.task, self.sc(s), self.d
         parent = self.card(t.entity_id, t.entity_name)
         errors, rej = [], []
         for c in [c for c in s.cands if not c.dropped and not c.site_url][:10]:
             idx = sc.page_indexes.get(c.page_id)
-            refs = idx.to_refs(None, limit=30) if idx else []
+            refs = []
+            if idx:  # the URLs printed next to this candidate's name come first, then the page's other links
+                first = idx.to_refs(c.near_link_ids)
+                taken = {r.link_id for r in first}
+                refs = first + [r for r in idx.to_refs(None, limit=30) if r.link_id not in taken][: max(30 - len(first), 0)]
             hits = d.search.hits_for(c.name, t.entity_name, country=c.country) if d.search else []
             sc.hits[c.ref] = {h.hit_id: h.url for h in hits}
             payload = WebsiteInput(entity=self.card(None, c.name, c.proposed_type), parent=parent, source_links=refs,
@@ -948,8 +1011,8 @@ class ResearchGraph:
                     rej.append(_rej("G1", f"link_id={o.selected_link_id}", "website link id not supplied"))
                     continue
                 url, method = idx.get(o.selected_link_id).url, "LINKED_ON_PARENT"
-            if not check_g5_platform_blocklist(url, frozenset(d.settings.shared_platform_domains)).allowed:
-                rej.append(_rej("G5", url, "blocklisted website"))
+            if (why := self._unusable_website(sc, c, url, frozenset(d.settings.shared_platform_domains))) is not None:
+                rej.append(_rej(*why))
                 continue
             reg = registrable_domain(url)
             c.site_url, c.site_method = url, method
@@ -1113,7 +1176,9 @@ class ResearchGraph:
             c.rel_extra = ev_list
             if c.ambiguous_ids:
                 flags.add(ConfidenceFlag.AMBIGUOUS_NAME)
-            has_site = bool(c.site_url and c.site_reachable and c.site_identity is not False)
+            # only the child's OWN site counts: a page of the parent's site (SECTION_OF_PARENT) never makes it eligible
+            has_site = bool(c.site_url and c.site_reachable and c.site_identity is not False
+                            and c.site_kind == WebsiteKind.OFFICIAL.value)
             if st.require_website_for_confirmed and not has_site and c.site_reachable is not False:
                 flags.add(ConfidenceFlag.NO_WEBSITE)
             res = d.calc.score([EvidenceInput(source_class=e.source_class, supports=e.supports, quote_verified=e.quote_verified,

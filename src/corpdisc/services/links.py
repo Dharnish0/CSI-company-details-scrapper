@@ -12,11 +12,13 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, Literal
+from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup, Tag
 
 from corpdisc.contracts.common import LinkRef
 from corpdisc.models.domain import PageType
+from corpdisc.services.normalize import has_public_suffix
 from corpdisc.services.urls import canonicalize_url
 
 if TYPE_CHECKING:
@@ -48,6 +50,8 @@ class IndexedLink:
     score_reasons: tuple[str, ...]
     page_type_hint: PageType | None
     position: int  # 0-based position of the first occurrence among <a> tags
+    origin: str = "anchor"  # "anchor" (an <a href>) or "text" (a URL that literally appears in the page text)
+    text_offset: int | None = None  # origin "text": character offset of the literal in the page text
 
 
 @dataclass(frozen=True)
@@ -266,3 +270,83 @@ def build_link_index(
             )
         )  # fmt: skip
     return LinkIndex(base_url=base_canon, links=tuple(out))
+
+
+# ---------------------------------------------------------------------------------------------------- text URLs
+# URL-like strings that literally appear in the page text (not as <a href>): "https://x.example/a", "www.x.example" or a bare
+# "x.example". They become link refs with runtime-assigned ids, so an agent can only ever choose a URL that was printed on the
+# page. A bare domain needs a real public suffix (checked through canonicalization), which rules out "Node.js" or "index.html".
+_TEXT_URL: Final = re.compile(
+    r"(?<![\w@./:-])(?:https?://[^\s<>\"'`)\]}]+"
+    r"|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}(?::\d+)?(?:/[^\s<>\"'`)\]}]*)?)",
+    re.I,
+)
+_MAX_TEXT_URLS: Final = 100
+
+
+def with_text_urls(
+    index: LinkIndex, text: str, *, extractor: TLDExtract | None = None, max_urls: int = _MAX_TEXT_URLS
+) -> LinkIndex:
+    """``index`` plus one link per distinct URL printed in ``text`` that is not already an anchor link.
+
+    New links get the next free ids (existing ids never change), ``origin="text"``, ``det_score=0`` (they never steer page
+    routing) and the character offset of the literal, which lets callers attribute a URL to the company named just before it.
+    """
+    base = canonicalize_url(index.base_url, extractor=extractor)
+    known = {lk.url for lk in index.links}
+    out = list(index.links)
+    added = 0
+    for m in _TEXT_URL.finditer(text or ""):
+        if added >= max_urls:
+            break
+        literal = m.group(0).rstrip(".,;:!?'\"")
+        if not literal:
+            continue
+        res = canonicalize_url(literal if re.match(r"https?://", literal, re.I) else "https://" + literal, extractor=extractor)
+        if (not res.ok or res.canonical is None or res.registrable_domain is None or res.canonical in known
+                or not has_public_suffix(res.host or "", extractor)):
+            continue
+        known.add(res.canonical)
+        added += 1
+        same_reg = base.registrable_domain is not None and res.registrable_domain == base.registrable_domain
+        out.append(IndexedLink(
+            link_id=len(out) + 1, url=res.canonical, raw_href=literal[:500], anchor_text=literal[:_MAX_ANCHOR],
+            title_attr=None, rel=(), location="body", same_domain=res.domain == base.domain,
+            same_registrable_domain=same_reg, det_score=0.0, score_reasons=("text_url",), page_type_hint=None,
+            position=m.start(), origin="text", text_offset=m.start(),
+        ))  # fmt: skip
+    return LinkIndex(base_url=index.base_url, links=tuple(out))
+
+
+# ------------------------------------------------------------------------------------------------- section links
+def _path_of(url: str) -> str:
+    return urlsplit(url).path or "/"
+
+
+def section_links(index: LinkIndex, page_url: str, *, listing_page: bool, exclude: Iterable[str] = ()) -> list[IndexedLink]:
+    """Same-site links that belong to the same section as ``page_url`` (document order, deterministic).
+
+    1. Links whose path lies under the page's own path (``/portfolio`` -> ``/portfolio/<anything>``). A root page has no section.
+    2. Otherwise, for a listing page only: the largest group (at least 3) of body links that share one parent directory, i.e. a
+       list of sibling pages such as ``/<slug>`` entries shown on the page. Navigation and footer links never count.
+    Anchor links only; the page itself, ``exclude`` and links with a query string are left out. Scope gates (G4/G5/G8) and
+    every budget are applied by the caller.
+    """
+    page = canonicalize_url(page_url)
+    selfs = {u for u in (page.canonical, index.base_url, page_url) if u} | set(exclude)
+    cand = [lk for lk in index.links
+            if lk.origin == "anchor" and lk.same_registrable_domain and lk.url not in selfs and lk.anchor_text
+            and "?" not in lk.url]
+    prefix = _path_of(page.canonical or page_url).rstrip("/")
+    if prefix:
+        under = [lk for lk in cand if _path_of(lk.url).startswith(prefix + "/")]
+        if under:
+            return under
+    if not listing_page:
+        return []
+    groups: dict[str, list[IndexedLink]] = {}
+    for lk in cand:
+        if lk.location == "body":
+            groups.setdefault(_path_of(lk.url).rstrip("/").rpartition("/")[0], []).append(lk)
+    best = max(groups.values(), key=len, default=[])  # first group wins a tie (dicts keep insertion order)
+    return best if len(best) >= 3 else []

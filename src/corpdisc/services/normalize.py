@@ -114,6 +114,15 @@ def normalize_domain(host_or_url: str) -> str:
     return host[4:] if host.startswith("www.") and len(host) > 4 else host
 
 
+def has_public_suffix(host_or_url: str, extractor: TLDExtract | None = None) -> bool:
+    """True when the host ends in a real public suffix (``.com``, ``.co.uk``), not an unknown label such as ``.html``."""
+    host = _host_of(host_or_url)
+    if not host or "." not in host:
+        return False
+    ext = _extractor(extractor)(host)
+    return bool(ext.suffix) and bool(getattr(ext, "top_domain_under_public_suffix", ""))
+
+
 def registrable_domain(host_or_url: str, extractor: TLDExtract | None = None) -> str | None:
     """Registered domain (public-suffix aware, offline). IP literals and single-label hosts map to
     themselves; unknown suffixes fall back to the last two labels. Empty input -> None."""
