@@ -74,7 +74,7 @@ from corpdisc.models.domain import (
 )
 from corpdisc.services.confidence import ConfidenceFlag, EvidenceInput
 from corpdisc.services.dom_candidates import extract_dom_candidates
-from corpdisc.services.links import build_link_index, guess_page_type, with_text_urls
+from corpdisc.services.links import build_link_index, guess_page_type, section_links, with_text_urls
 from corpdisc.services.matcher import MatchCandidate
 from corpdisc.services.normalize import normalize_domain, normalize_name, normalize_text, registrable_domain
 from corpdisc.services.urls import canonicalize_url
@@ -104,6 +104,7 @@ ENTRY_MIN_DOM_CANDIDATES: Final = 3  # a start page without a listing URL needs 
 _LISTING_TYPES: Final = frozenset({PageType.COMPANIES, PageType.PORTFOLIO, PageType.BRANDS, PageType.SUBSIDIARIES,
                                  PageType.OPERATING_GROUPS})
 MAX_CHUNKS_PER_PAGE: Final = 6
+SECTION_CALL_RESERVE: Final = 5  # LLM calls of a task that section pages may not use (website, relationship, re-asks)
 TEXT_URL_NEAR_CHARS: Final = 300  # a URL printed this close after a name (and before the next name) is that name's website
 # Output-limit awareness. The extraction agent caps output at 3000 tokens (hard cap 8192) and one ExtractedEntity (name, verbatim
 # quote, reason, description) can cost 100-250 of them, so a dense chunk can outgrow the cap. A chunk that hits
@@ -200,6 +201,7 @@ class ResearchState(BaseModel):
     committed_ids: list[int] = Field(default_factory=list)
     enqueued_task_ids: list[int] = Field(default_factory=list)
     partial: bool = False
+    section_followed: bool = False  # the same-section pages of a listing that yielded no company were fetched (once)
     rel_unavailable: bool = False
     retry_after_s: float | None = None
     retry_reason: str = ""
@@ -245,10 +247,16 @@ class Scratch:
     hits: dict[str, dict[int, str]] = None  # type: ignore[assignment]
     page_dom: dict[int, Any] = None  # type: ignore[assignment]
     learned_cap: int | None = None  # DOM candidates per call that were seen to outgrow the output cap, halved
+    # bookkeeping that lets the extract/gate nodes run a second time for the section pages without redoing the first pass
+    built_pages: set[int] = None  # type: ignore[assignment]
+    attempted: set[str] = None  # type: ignore[assignment]  # chunk keys already sent to the extraction agent
+    gated_upto: int = 0  # sc.extractions[:gated_upto] went through gate_extraction
+    seen_norms: set[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         self.page_indexes, self.chunks, self.extractions, self.parent_regs, self.hits = {}, {}, [], set(), {}
         self.page_dom = {}
+        self.built_pages, self.attempted, self.seen_norms = set(), set(), set()
 
 
 def _rej(gate: str, ref: str, detail: str, inv: int | None = None) -> dict[str, Any]:
@@ -331,7 +339,7 @@ class ResearchGraph:
              "fetch_pages", "build_extraction_inputs", "extraction_agent", "gate_extraction", "match_known",
              "route_website", "website_agent", "gate_website", "dedupe_resolve", "relationship_agent",
              "verify_and_score", "commit", "route_enqueue", "mark_terminal", "mark_unreachable", "defer_retry",
-             "finish")  # fmt: skip
+             "follow_section", "finish")  # fmt: skip
 
     def __init__(self, deps: ResearchDeps) -> None:
         self.d = deps
@@ -588,12 +596,19 @@ class ResearchGraph:
             if (r.error_code or "").startswith("BUDGET_"):
                 budget_hits += 1
                 run_stop = run_stop or "TOTAL_PAGE_LIMIT" in (r.error_code or "")
+                rej.append(_rej("G9", a["url"], f"UNPROCESSED_BRANCH: not fetched, {r.error_code}"))
                 continue
             if not check_g6_reachability(SimpleNamespace(status=r.crawl_status.value, text=r.text, error=r.error)).allowed:
                 rej.append(_rej("G6", a["url"], r.error or r.error_code or "fetch failed"))
                 continue
             if r.page_id not in ids:  # the start page comes back from the visited cache: never listed twice
                 ids.append(r.page_id)
+        if s.section_followed:  # second round: only pages that were not part of the first one count
+            if not [i for i in ids if i not in s.page_ids]:
+                if budget_hits and run_stop:
+                    return {**self.stop("page budget exhausted", "run"), "rejections": rej}
+                return {"rejections": rej, "route": "mark_terminal", "terminal_reason": "NO_CANDIDATES"}
+            return {"page_ids": ids, "rejections": rej, "route": "build_extraction_inputs"}
         fetched = [i for i in ids if i != s.entry_page_id]
         if not fetched:
             if budget_hits:
@@ -605,12 +620,62 @@ class ResearchGraph:
             return {"rejections": rej, "route": "mark_terminal", "terminal_reason": "NO_PAGES_FETCHED"}
         return {"page_ids": ids, "rejections": rej, "route": "build_extraction_inputs"}
 
+    def n_follow_section(self, s: ResearchState) -> dict[str, Any]:
+        """A listing page produced no company, but links that belong to its own section may (e.g. ``/portfolio/<name>/``).
+        Fetch them once as extra pages of the SAME entity. Bounded by MAX_LINKS_PER_ENTITY, by the task's remaining LLM-call
+        allowance (each page costs at least one extraction call; SECTION_CALL_RESERVE calls stay free for website and
+        relationship checks), and by the page budgets and robots/crawl-delay handling of the fetch service. Every section
+        link that is not followed is stored as a G9 'UNPROCESSED_BRANCH' rejection, never dropped silently."""
+        sc, d, t = self.sc(s), self.d, s.task
+        visited: set[str] = {sc.base_url, sc.entry_canonical, *(a["url"] for a in s.approved)}  # approved: asked for already
+        rows = {pid: d.pages_repo.get_page_by_id(pid) for pid in s.page_ids}
+        for row in rows.values():
+            visited.update(u for u in (row.canonical_url, row.final_url) if u)
+        found: list[tuple[Any, str]] = []   # (link, page type label) in page then document order
+        rej: list[dict[str, Any]] = []
+        seen: set[str] = set(visited)
+        for pid in s.page_ids:
+            idx, row = sc.page_indexes.get(pid), rows[pid]
+            if idx is None:
+                continue
+            page_url = row.final_url or row.canonical_url
+            listing = guess_page_type(page_url) in _LISTING_TYPES or (pid == s.entry_page_id and sc.use_entry)
+            for lk in section_links(idx, page_url, listing_page=listing, exclude=visited):
+                hint = lk.page_type_hint.value if lk.page_type_hint else None
+                checks = [check_g4_scope(hint, lk.url),
+                          check_g5_platform_blocklist(lk.url, frozenset(d.settings.shared_platform_domains)),
+                          check_g8_url_canonical(lk.url, sc.base_url, seen, t.entity_id)]
+                bad = next((r for r in checks if not r.allowed), None)
+                if bad is not None:
+                    if bad.reason != "DUPLICATE_URL":  # an already-seen page is simply not an extra page
+                        rej.append(_rej("G4" if bad.reason == "EXCLUDED_SCOPE" else "G5" if "BLOCK" in (bad.reason or "").upper()
+                                        else "G8", lk.url, bad.detail or bad.reason or ""))
+                    continue
+                seen.add(lk.url)
+                found.append((lk, hint or (row.page_type if row.page_type in PageType._value2member_map_ else "OTHER")))
+        if not found:
+            return {"section_followed": True, "rejections": rej, "route": "mark_terminal", "terminal_reason": "NO_CANDIDATES"}
+        room = d.settings.max_llm_calls_per_task - d.budget.llm_calls(t.task_id) - SECTION_CALL_RESERVE
+        cap = max(0, min(self.max_links(), room))
+        follow, left = found[:cap], found[cap:]
+        why = ("MAX_LINKS_PER_ENTITY" if cap == self.max_links() else "TASK_LLM_CALL_ALLOWANCE")
+        rej += [_rej("G9", lk.url, f"UNPROCESSED_BRANCH: same-section link not followed ({why}, {cap} of {len(found)} followed)")
+                for lk, _ in left[:50]]
+        if not follow:
+            return {"section_followed": True, "rejections": rej, "route": "mark_terminal", "terminal_reason": "NO_CANDIDATES"}
+        approved = [{"link_id": lk.link_id, "url": lk.url, "page_type": ptype} for lk, ptype in follow]
+        log.info("task %s: listing yielded no company; following %d of %d same-section links", t.task_id, len(follow), len(found))
+        return {"section_followed": True, "approved": approved, "rejections": rej, "route": "fetch_pages"}
+
     def n_build_extraction_inputs(self, s: ResearchState) -> dict[str, Any]:
         sc, d = self.sc(s), self.d
         approved = {a["url"]: a for a in s.approved}
         for pid in s.page_ids:
             if pid == s.entry_page_id and not sc.use_entry:
                 continue
+            if pid in sc.built_pages:  # second round (section pages): the first round's pages are already chunked
+                continue
+            sc.built_pages.add(pid)
             row = d.pages_repo.get_page_by_id(pid)
             text, html = d.fetch.load_text(pid), d.fetch.load_html(pid)
             if text is None:
@@ -678,9 +743,10 @@ class ResearchGraph:
         partial, errors, rej, inv_reviews = False, [], [], []
         transient = False
         retry_resp: AgentResponse | None = None
-        pending = list(sc.chunks)
+        pending = [k for k in sc.chunks if k not in sc.attempted]  # a second round only sends the section pages' chunks
         while pending:
             key = pending.pop(0)
+            sc.attempted.add(key)
             ch = sc.chunks[key]
             if sc.learned_cap is not None and len(ch["dom"]) > sc.learned_cap and (subs := self._split_failed_chunk(sc, key)):
                 pending[0:0] = subs  # an earlier chunk of this task was truncated: do not repeat the mistake
@@ -728,8 +794,8 @@ class ResearchGraph:
                     "retry_after_s": retry_resp.error.retry_after_s, "retry_reason": "EXTRACTION_RETRY_PENDING",
                     "rate_limited": retry_resp.error.rate_limited}
         route = "gate_extraction" if sc.extractions else "mark_terminal"
-        upd: dict[str, Any] = {"errors": errors, "rejections": rej, "partial": partial, "route": route,
-                               "transient_incomplete": transient}
+        upd: dict[str, Any] = {"errors": errors, "rejections": rej, "partial": partial or s.partial, "route": route,
+                               "transient_incomplete": transient or s.transient_incomplete}
         if not sc.extractions:
             upd["terminal_reason"] = "NO_USABLE_EXTRACTION"
         if partial and not sc.extractions:
@@ -738,9 +804,10 @@ class ResearchGraph:
 
     def n_gate_extraction(self, s: ResearchState) -> dict[str, Any]:
         sc, d = self.sc(s), self.d
-        cands, rows, rej, seen = [], [], [], set()
+        cands, rows, rej, seen = [], [], [], sc.seen_norms
         sibling = 0
-        for key, out in sc.extractions:
+        fresh, sc.gated_upto = sc.extractions[sc.gated_upto:], len(sc.extractions)  # a 2nd round gates only the new ones
+        for key, out in fresh:
             ch = sc.chunks[key]
             if not (g12 := check_g12_schema_enum(out)).allowed:
                 rej.append(_rej("G12", key, g12.detail or "schema"))
@@ -782,6 +849,8 @@ class ResearchGraph:
         upd["route"] = "match_known" if cands else "mark_terminal"
         if not cands:
             upd["terminal_reason"] = "NO_CANDIDATES"
+            if not s.partial and not s.section_followed:  # a listing with no company: try the pages of its own section
+                upd["route"] = "follow_section"
         if not cands and s.partial:
             upd["outcome"] = "PARTIAL"
         return upd
