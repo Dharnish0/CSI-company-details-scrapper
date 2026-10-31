@@ -254,3 +254,14 @@ def test_requeue_retryable_partials_ignores_other_done_tasks(tmp_path):
     assert rows[tasks[0]]["error"].startswith("REQUEUED:")
     assert rows[tasks[1]]["status"] == "DONE" and rows[tasks[1]]["error"] == "PARTIAL:VERIFICATION_UNAVAILABLE"
     assert rows[tasks[2]]["status"] == "DONE"
+
+
+def test_rate_limited_deferrals_do_not_use_up_the_per_task_llm_call_allowance(tmp_path):
+    w = seeded_world(tmp_path, settings_kw={"max_llm_calls_per_task": 3})
+    failing(w, schema="ExtractionOutput", rate_limited=True, times=18)  # three invocations, each refused on all six tries
+    s = w.sup.run(max_tasks=1)
+    assert s.retries == 3 and s.status != "FAILED"
+    assert w.q("SELECT COUNT(*) FROM agent_invocations WHERE failure_kind='TRANSPORT'")[0][0] == 3
+    assert not w.q("SELECT 1 FROM agent_invocations WHERE failure_kind='BUDGET'")      # the cap never bit
+    assert w.q("SELECT attempts FROM research_queue WHERE task_id=1")[0][0] == 1       # and no attempt was used either
+    assert w.deps.budget.llm_calls(1) <= 3 and w.deps.budget.llm_calls() >= 3          # the run-wide count is unchanged

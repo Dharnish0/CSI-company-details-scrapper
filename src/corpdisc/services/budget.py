@@ -110,7 +110,10 @@ class BudgetGuard:
         )
         params: list[object] = [self._run_id, *_NO_PROVIDER_CALL]
         if task_id is not None:
-            sql += " AND task_id = ?"
+            # per task only: an invocation that ended FAILED/TRANSPORT without a single request reaching the model (every try
+            # was an HTTP 429) did no model work, so a task that is rescheduled after rate limits does not use up its allowance
+            sql += (" AND task_id = ? AND NOT (status = 'FAILED' AND failure_kind = 'TRANSPORT' AND json_valid(response_json) "
+                    "AND json_extract(response_json, '$.transport.requests') = 0)")
             params.append(task_id)
         return int(self._conn.execute(sql, params).fetchone()[0])
 
