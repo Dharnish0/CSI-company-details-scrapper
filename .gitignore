@@ -20,3 +20,5 @@ logs/*
 *.xlsx
 preflight_out/
 forensics_out/
+
+*.lock
