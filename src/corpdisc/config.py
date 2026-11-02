@@ -108,6 +108,18 @@ class Settings(BaseSettings):
     queue_retry_wait_max_seconds: float = Field(default=300.0, ge=0)  # longer waits pause the run (resumable)
     queue_max_rate_limit_deferrals: int = Field(default=6, ge=0)  # HTTP 429 waits per task that keep the attempt (0 = off)
     llm_cassette_dir: Path = Path("./.cache/llm_cassettes")
+    # Slow crawl mode (--slow-crawl): one provider request at a time, a fixed minimum gap, adaptive pacing, 24 h runtime cap
+    slow_crawl: bool = False
+    slow_crawl_interval_seconds: float = Field(default=90.0, ge=0)  # minimum start-to-start gap between provider requests
+    slow_crawl_max_runtime_hours: float = Field(default=24.0, gt=0, le=168)
+    slow_crawl_token_ceiling: int = Field(default=250_000, ge=1)  # tokens spent by one slow-crawl session
+    slow_crawl_cost_ceiling_usd: float | None = Field(default=None, ge=0)  # None = no cost ceiling
+    slow_crawl_tpm_limit: int = Field(default=8000, ge=0)  # tokens/minute used when the provider sends no limit header
+    slow_crawl_tpd_limit: int = Field(default=200_000, ge=0)  # tokens/day estimate for proactive waiting (0 = off)
+    slow_crawl_tpm_target_fraction: float = Field(default=0.70, gt=0, le=1)  # share of the TPM limit the pacing aims at
+    slow_crawl_daily_retry_seconds: float = Field(default=900.0, ge=60)  # wait after a daily-quota 429 without Retry-After
+    slow_crawl_sleep_chunk_seconds: float = Field(default=30.0, ge=1, le=60)  # longest uninterrupted sleep (shutdown latency)
+    slow_crawl_progress_interval_seconds: float = Field(default=300.0, ge=10)  # progress report cadence while running
     # M8 real providers
     llm_timeout_seconds: float = Field(default=300.0, gt=0)
     llm_base_url: str = ""
@@ -170,7 +182,7 @@ class Settings(BaseSettings):
     def _blank_path_is_none(cls, v: Any) -> Any:
         return None if isinstance(v, str) and not v.strip() else v
 
-    @field_validator("llm_token_budget", mode="before")
+    @field_validator("llm_token_budget", "slow_crawl_cost_ceiling_usd", mode="before")
     @classmethod
     def _blank_budget_is_none(cls, v: Any) -> Any:
         if isinstance(v, str) and not v.strip():
