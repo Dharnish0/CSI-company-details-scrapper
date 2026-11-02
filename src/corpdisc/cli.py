@@ -27,6 +27,7 @@ BILLABLE_PROVIDERS = frozenset({"openai", "anthropic", "gemini", "groq"})
 
 # Exit codes of `run` / `resume`.
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_INCOMPLETE, EXIT_PARTIAL = 0, 1, 2, 3, 4
+EXIT_INTERRUPTED, EXIT_LOCKED = 5, 6  # slow crawl: stopped by Ctrl+C / SIGTERM; another crawler holds the database lock
 RUN_EXIT_CODES = {"COMPLETED": EXIT_OK, "PARTIAL": EXIT_PARTIAL, "FAILED": EXIT_FAILED}  # all others: EXIT_INCOMPLETE
 
 
@@ -46,6 +47,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--yes", action="store_true", help="confirm that a real (billable) LLM provider may be used")
         sp.add_argument("--provider", type=str, default=None, help="LLM provider (e.g., groq, gemini, ollama)")
         sp.add_argument("--model", type=str, default=None, help="LLM model name (e.g., openai/gpt-oss-120b)")
+        sp.add_argument("--slow-crawl", action="store_true",
+                        help="slow crawl mode: one provider request at a time, adaptive pacing, automatic 429 cooldown "
+                             "and resume, runtime and token ceilings (see the SLOW_CRAWL_* settings)")
         if name == "resume":
             sp.add_argument("--run-id", type=int, default=None)
     ep = sub.add_parser("export", help="assign Tree IDs and write the Excel workbook from the database")
@@ -195,6 +199,8 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool) -> int:
     settings = _load()
     if settings is None:
         return EXIT_USAGE
+    if args.slow_crawl:  # the SLOW_CRAWL=true environment value enables it as well
+        settings = settings.model_copy(update={"slow_crawl": True})
     interactive = not (args.provider or args.model) and _stdin_is_interactive()
     selection = _resolve_selection(args, settings)
     if selection is None:
@@ -217,7 +223,9 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool) -> int:
     if provider in BILLABLE_PROVIDERS and not args.yes:
         notice = (f"billable provider '{provider}' (model {model or '?'}) against {settings.start_url}. "
                   f"Limits: max_depth={settings.max_depth}, max_total_pages={settings.max_total_pages}, "
-                  f"token budget={settings.llm_token_budget or 'unlimited'}.")
+                  f"token budget={settings.llm_token_budget or 'unlimited'}."
+                  + (f" Slow crawl: up to {settings.slow_crawl_max_runtime_hours:g} h, session token ceiling "
+                     f"{settings.slow_crawl_token_ceiling}." if settings.slow_crawl else ""))
         if not interactive:
             print(f"Refusing to use the {notice}\nRe-run with --yes to confirm; refusing without --yes.", file=sys.stderr)
             return EXIT_USAGE
