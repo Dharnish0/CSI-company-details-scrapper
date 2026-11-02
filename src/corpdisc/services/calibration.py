@@ -23,6 +23,13 @@ def _map(conn: sqlite3.Connection, sql: str, *params: Any) -> dict[str, int]:
     return {str(r[0]): int(r[1]) for r in _rows(conn, sql, *params)}
 
 
+def count_http_429(conn: sqlite3.Connection, run_id: int) -> int:
+    """HTTP 429 replies seen by the gateway: ``RATE_LIMITED`` entries in the persisted ``transport.errors`` lists."""
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM agent_invocations i, json_each(CASE WHEN json_valid(i.response_json) THEN i.response_json "
+        "ELSE '{}' END, '$.transport.errors') je WHERE i.run_id = ? AND je.value = 'RATE_LIMITED'", (run_id,)).fetchone()[0])
+
+
 def build_report(conn: sqlite3.Connection, run_id: int) -> dict[str, Any]:
     run = _rows(conn, "SELECT * FROM runs WHERE run_id=?", run_id)
     if not run:
@@ -89,6 +96,7 @@ def build_report(conn: sqlite3.Connection, run_id: int) -> dict[str, Any]:
                      "merged": _rows(conn, "SELECT COUNT(*) FROM entities WHERE run_id=? AND merged_into_id IS NOT NULL", run_id)[0][0]},
         "llm": {"per_agent": per_agent, "provider_calls": tot_calls, "cache_hits": tot_hits,
                 "cache_hit_rate": round(tot_hits / (tot_hits + tot_calls), 4) if (tot_hits + tot_calls) else None,
+                "http_429": count_http_429(conn, run_id),
                 "calls_per_task": round(tot_calls / n_tasks, 3),
                 "cost_per_entity_usd": round(cost / non_root, 6) if non_root else None,
                 "tokens_per_entity": round(tokens / non_root, 1) if non_root else None,

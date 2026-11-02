@@ -1,4 +1,4 @@
-"""Command line interface: init-db, llms, run, resume, report, export, verify."""
+"""Command line interface: init-db, llms, run, resume, progress, report, export, verify."""
 
 from __future__ import annotations
 
@@ -57,6 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
     ep.add_argument("--output", type=str, default=None, help="workbook path (default OUTPUT_XLSX)")
     vp = sub.add_parser("verify", help="re-check data quality from the database (evidence grounding, duplicates, cycles ...)")
     vp.add_argument("--run-id", type=int, default=None)
+    pp = sub.add_parser("progress", help="live progress of a run (read-only): entities, tasks, API use, tokens, retries, budgets")
+    pp.add_argument("--run-id", type=int, default=None)
+    pp.add_argument("--watch", type=float, default=None, metavar="SECONDS", help="refresh every SECONDS until Ctrl+C")
+    pp.add_argument("--json", action="store_true", help="machine-readable output")
     rp = sub.add_parser("report", help="print the calibration report (status, calls, failures, tokens, cost, review ratio)")
     rp.add_argument("--run-id", type=int, default=None)
     rp.add_argument("--json", action="store_true", help="machine-readable output")
@@ -314,6 +318,45 @@ def _cmd_report(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_progress(args: argparse.Namespace) -> int:
+    """Read-only progress snapshot: opens the database with connect_readonly only (never init_db, never a write)."""
+    from corpdisc.app import latest_run_id
+    from corpdisc.clock import SystemClock
+    from corpdisc.db.connection import connect_readonly
+    from corpdisc.services.instance_lock import read_session
+    from corpdisc.services.progress import build_progress, format_progress
+
+    settings = _load(setup=False)
+    if settings is None:
+        return EXIT_USAGE
+    if args.watch is not None and args.watch <= 0:
+        print("--watch needs a positive number of seconds.", file=sys.stderr)
+        return EXIT_USAGE
+    clock = SystemClock()
+    try:
+        while True:
+            conn = connect_readonly(settings.db_path)
+            try:
+                run_id = args.run_id or latest_run_id(conn)
+                if run_id is None:
+                    print("No runs in the database.", file=sys.stderr)
+                    return EXIT_USAGE
+                prog = build_progress(conn, run_id, settings, now=clock.now(), session=read_session(settings.db_path))
+            finally:
+                conn.close()
+            print(json.dumps(prog, indent=2, sort_keys=True, default=str) if args.json else format_progress(prog), flush=True)
+            if args.watch is None:
+                return EXIT_OK
+            if not args.json:
+                print()
+            clock.sleep(args.watch)
+    except (LookupError, DatabaseError) as exc:
+        print(f"Cannot show progress: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    except KeyboardInterrupt:
+        return EXIT_OK
+
+
 def _cmd_export(args: argparse.Namespace) -> int:
     from corpdisc.services.excel import export_workbook
     from corpdisc.services.tree import assign_tree_ids
@@ -386,6 +429,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_run(args, resume=args.command == "resume")
     if args.command == "report":
         return _cmd_report(args)
+    if args.command == "progress":
+        return _cmd_progress(args)
     if args.command == "export":
         return _cmd_export(args)
     if args.command == "verify":
