@@ -61,11 +61,36 @@ def _deny(reason: str, detail: str, limit: float, used: float) -> BudgetDecision
     return BudgetDecision(allow=False, reason=reason, detail=detail, limit=limit, used=used)
 
 
+@dataclass(frozen=True)
+class SessionCeiling:
+    """Slow-crawl spending guard, measured per process start against the totals read at start (decision D8).
+
+    ``cost_ceiling_usd=None`` disables the cost check; it is also inert while both prices are 0 (no cost is recorded).
+    """
+
+    baseline_tokens: int
+    token_ceiling: int
+    baseline_cost: float = 0.0
+    cost_ceiling_usd: float | None = None
+    price_in_per_mtok: float = 0.0
+    price_out_per_mtok: float = 0.0
+
+    @property
+    def cost_check_active(self) -> bool:
+        return self.cost_ceiling_usd is not None and (self.price_in_per_mtok > 0 or self.price_out_per_mtok > 0)
+
+    def estimate_cost(self, tokens_in: int, tokens_out: int) -> float:
+        return (max(tokens_in, 0) * self.price_in_per_mtok + max(tokens_out, 0) * self.price_out_per_mtok) / 1_000_000
+
+
 class BudgetGuard:
-    def __init__(self, conn: sqlite3.Connection, *, run_id: int, limits: BudgetLimits) -> None:
+    def __init__(self, conn: sqlite3.Connection, *, run_id: int, limits: BudgetLimits,
+                 session: SessionCeiling | None = None, exclude_rate_limited_from_run_count: bool = False) -> None:
         self._conn = conn
         self._run_id = run_id
         self.limits = limits
+        self.session = session
+        self._exclude_rate_limited = exclude_rate_limited_from_run_count
 
     # ------------------------------------------------------------------ crawl limits
     def check_depth(self, depth: int) -> BudgetDecision:
@@ -115,6 +140,10 @@ class BudgetGuard:
             sql += (" AND task_id = ? AND NOT (status = 'FAILED' AND failure_kind = 'TRANSPORT' AND json_valid(response_json) "
                     "AND json_extract(response_json, '$.transport.requests') = 0)")
             params.append(task_id)
+        elif self._exclude_rate_limited:
+            # slow crawl only: hours of waiting on HTTP 429 must not use up MAX_LLM_CALLS_PER_RUN (same rule as per task)
+            sql += (" AND NOT (status = 'FAILED' AND failure_kind = 'TRANSPORT' AND json_valid(response_json) "
+                    "AND json_extract(response_json, '$.transport.requests') = 0)")
         return int(self._conn.execute(sql, params).fetchone()[0])
 
     def tool_calls(self, task_id: int | None = None) -> int:
@@ -147,6 +176,10 @@ class BudgetGuard:
             if used >= budget or needed > budget:
                 return _deny("TOKEN_BUDGET_EXHAUSTED",
                              f"{used} of {budget} tokens used; call needs about {needed - used} more", budget, used)
+        if self.session is not None:
+            denied = self.check_session(estimated_input_tokens, requested_output_tokens)
+            if not denied.allow:
+                return denied
         if task_id is not None:
             made = self.llm_calls(task_id)
             if made >= self.limits.max_llm_calls_per_task:
@@ -156,6 +189,45 @@ class BudgetGuard:
         if made_run >= self.limits.max_llm_calls_per_run:
             return _deny("RUN_LLM_CALL_LIMIT", f"{made_run} LLM calls in this run",
                          self.limits.max_llm_calls_per_run, made_run)
+        return _allow()
+
+    def session_usage(self) -> dict[str, float | int | bool | None]:
+        """Tokens and cost spent since this session started, and what is left of the session ceilings (None = no ceiling)."""
+        s = self.session
+        row = self._run_row()
+        total_tokens, total_cost = int(row["llm_tokens_used"] or 0), float(row["llm_cost_usd"] or 0)
+        if s is None:
+            return {"active": False, "tokens": None, "token_ceiling": None, "tokens_remaining": None,
+                    "cost_usd": None, "cost_ceiling_usd": None, "cost_remaining_usd": None, "cost_check_active": False}
+        tokens = max(total_tokens - s.baseline_tokens, 0)
+        cost = max(total_cost - s.baseline_cost, 0.0)
+        return {
+            "active": True, "tokens": tokens, "token_ceiling": s.token_ceiling,
+            "tokens_remaining": max(s.token_ceiling - tokens, 0),
+            "cost_usd": cost, "cost_ceiling_usd": s.cost_ceiling_usd,
+            "cost_remaining_usd": None if s.cost_ceiling_usd is None else max(s.cost_ceiling_usd - cost, 0.0),
+            "cost_check_active": s.cost_check_active,
+        }
+
+    def check_session(self, estimated_input_tokens: int = 0, requested_output_tokens: int = 0) -> BudgetDecision:
+        """Slow-crawl token and cost ceilings. Reasons contain ``TOKEN_BUDGET`` so the research graph stops at run scope."""
+        s = self.session
+        if s is None:
+            return _allow()
+        usage = self.session_usage()
+        used = int(usage["tokens"] or 0)
+        need = max(estimated_input_tokens, 0) + max(requested_output_tokens, 0)
+        if used >= s.token_ceiling or used + need > s.token_ceiling:
+            return _deny("TOKEN_BUDGET_SLOW_CRAWL_CEILING",
+                         f"{used} of {s.token_ceiling} session tokens used; call needs about {need} more", s.token_ceiling, used)
+        if s.cost_check_active:
+            assert s.cost_ceiling_usd is not None
+            cost = float(usage["cost_usd"] or 0)
+            projected = cost + s.estimate_cost(estimated_input_tokens, requested_output_tokens)
+            if cost >= s.cost_ceiling_usd or projected > s.cost_ceiling_usd:
+                return _deny("TOKEN_BUDGET_SLOW_CRAWL_COST_CEILING",
+                             f"session cost ${cost:.4f} of ${s.cost_ceiling_usd:.4f}; call projects ${projected:.4f}",
+                             s.cost_ceiling_usd, cost)
         return _allow()
 
     def check_tool_call(self, *, task_id: int | None) -> BudgetDecision:
