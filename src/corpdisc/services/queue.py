@@ -221,6 +221,25 @@ class QueueService:
                 (iso_utc(not_before), task_id),
             )
 
+    def release_running(self, task_id: int) -> bool:
+        """Slow-crawl shutdown: give a RUNNING task back (PENDING, attempt returned). ``not_before`` and ``error`` are left
+        as they are; DONE/FAILED/SKIPPED/PENDING rows are never touched. Returns True when a row was released."""
+        with self._tx():
+            cur = self._conn.execute(
+                "UPDATE research_queue SET status = 'PENDING', finished_at = NULL, attempts = MAX(attempts - 1, 0) "
+                "WHERE task_id = ? AND status = 'RUNNING'", (task_id,))
+            return cur.rowcount == 1
+
+    def defer_all_pending(self, run_id: int, not_before: datetime) -> int:
+        """Daily-quota cooldown: move ``not_before`` of every PENDING task forward to at least ``not_before`` (never back).
+        Returns the number of rows changed."""
+        value = iso_utc(not_before)
+        with self._tx():
+            cur = self._conn.execute(
+                "UPDATE research_queue SET not_before = ? WHERE run_id = ? AND status = 'PENDING' "
+                "AND (not_before IS NULL OR not_before < ?)", (value, run_id, value))
+            return cur.rowcount
+
     def defer_domain(self, run_id: int, domain: str, not_before: datetime) -> int:
         """Set not_before on PENDING tasks whose start_url is on ``domain``. Returns rows changed."""
         changed = 0
