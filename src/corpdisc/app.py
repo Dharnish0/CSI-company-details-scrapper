@@ -35,10 +35,11 @@ from corpdisc.db.repos.pages import PageRepo
 from corpdisc.db.repos.runs import RunRepo
 from corpdisc.graphs.deps import ResearchDeps
 from corpdisc.graphs.support import AdvisorService, DedupService
+from corpdisc.graphs.slow_crawl import SlowCrawlController
 from corpdisc.graphs.supervisor import Supervisor, init_run
 from corpdisc.graphs.tools import make_page_excerpt_spec
 from corpdisc.logging_setup import get_logger
-from corpdisc.services.budget import BudgetGuard, BudgetLimits
+from corpdisc.services.budget import BudgetGuard, BudgetLimits, SessionCeiling
 from corpdisc.services.committer import Committer
 from corpdisc.services.confidence import ConfidenceCalculator
 from corpdisc.services.cycle_guard import CycleGuard
@@ -51,6 +52,7 @@ from corpdisc.services.fetch import (
     make_page_text_loader,
     make_robots_fetcher,
 )
+from corpdisc.services.instance_lock import InstanceLock
 from corpdisc.services.llm_http import RequestsJsonTransport
 from corpdisc.services.matcher import Matcher
 from corpdisc.services.pagecache import PageCache
@@ -76,6 +78,7 @@ class Runtime:
     provider: LLMProvider
     _closers: list[Any] = field(default_factory=list)
     limiter: SlowCrawlLimiter | None = None  # set only in slow crawl mode
+    slow: SlowCrawlController | None = None  # set only in slow crawl mode
 
     def close(self) -> None:
         for c in self._closers:
@@ -145,6 +148,7 @@ def build_runtime(
     run_model: str | None = None,  # Runtime model override
     stop_check: Callable[[], str | None] | None = None,  # slow crawl: returns a stop reason (e.g. "SHUTDOWN") or None
     deadline: float | None = None,  # slow crawl: monotonic deadline; default = now + SLOW_CRAWL_MAX_RUNTIME_HOURS
+    lock: InstanceLock | None = None,  # slow crawl: the held single-instance lock; its session file gets heartbeats
 ) -> Runtime:
     """Wire everything. ``run_id=None`` creates a new run; pass an id to resume one. Never touches the network.
     
@@ -161,6 +165,7 @@ def build_runtime(
         run_model: Override model for this run (e.g., "openai/gpt-oss-120b")
         stop_check: Slow crawl only. Polled while the limiter waits; a non-empty reason stops new provider requests.
         deadline: Slow crawl only. Monotonic time after which no new provider request starts.
+        lock: Slow crawl only. The already acquired ``InstanceLock``; the controller writes state and heartbeats into it.
     """
     init_db(settings.db_path)
     conn = connect_writer(settings.db_path)
@@ -201,7 +206,21 @@ def build_runtime(
     robots = RobotsService(fetcher=make_robots_fetcher(http, throttle, user_agent=cfg.user_agent, timeout=cfg.timeout),
                            store=PageRepoRobotsStore(pages), user_agent=cfg.user_agent, clock=clock,
                            respect_robots=cfg.respect_robots, failure_cooldown_seconds=cfg.robots_failure_cooldown)
-    budget = BudgetGuard(conn, run_id=run_id, limits=BudgetLimits.from_settings(settings))
+    session = None
+    if settings.slow_crawl:
+        if deadline is None:
+            deadline = clock.monotonic() + settings.slow_crawl_max_runtime_hours * 3600.0
+        row = conn.execute("SELECT llm_tokens_used, llm_cost_usd FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            conn.close()
+            raise ValueError(f"unknown run_id {run_id}")
+        # ceilings count from what the run already holds, so a resumed run gets a full session allowance (decision D8)
+        session = SessionCeiling(
+            baseline_tokens=int(row["llm_tokens_used"] or 0), token_ceiling=settings.slow_crawl_token_ceiling,
+            baseline_cost=float(row["llm_cost_usd"] or 0.0), cost_ceiling_usd=settings.slow_crawl_cost_ceiling_usd,
+            price_in_per_mtok=settings.llm_price_in_per_mtok, price_out_per_mtok=settings.llm_price_out_per_mtok)
+    budget = BudgetGuard(conn, run_id=run_id, limits=BudgetLimits.from_settings(settings), session=session,
+                         exclude_rate_limited_from_run_count=session is not None)
     renderer = None if settings.use_playwright == "false" else PlaywrightRenderer()  # imports playwright lazily
     fetch = FetchService(config=cfg, pages=pages, cache=cache, robots=robots, http=http, throttle=throttle, clock=clock,
                          sleeper=sleeper, budget=budget, renderer=renderer)
@@ -235,4 +254,7 @@ def build_runtime(
                 "website": WebsiteAgent(), "advisor": AdvisorAgent(), "dedup": DedupAgent(), "validation": ValidationAgent()},
         advisor=AdvisorService() if settings.advisor_enabled else None, dedup=DedupService(), search=search,
         export_path=settings.output_xlsx)
-    return Runtime(settings, conn, run_id, deps, Supervisor(deps, runs, sleeper), provider, closers, limiter)
+    slow = None
+    if limiter is not None and deadline is not None:
+        slow = SlowCrawlController(deps, limiter=limiter, sleeper=sleeper, deadline=deadline, stop_check=stop_check, lock=lock)
+    return Runtime(settings, conn, run_id, deps, Supervisor(deps, runs, sleeper, slow=slow), provider, closers, limiter, slow)

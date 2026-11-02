@@ -171,6 +171,8 @@ class SlowCrawlLimiter:
         self.rate_limited = 0
         self.last_429_scope: str | None = None
         self.total_wait_s = 0.0
+        self.refusals = 0  # acquire() calls refused (shutdown / runtime limit); the supervisor requeues the task they hit
+        self.last_refusal: str | None = None
 
     # ------------------------------------------------------------------ internals
     def _mono(self) -> float:
@@ -183,6 +185,11 @@ class SlowCrawlLimiter:
         if self.deadline is not None and self._mono() >= self.deadline:
             return "MAX_RUNTIME"
         return None
+
+    def _refuse(self, reason: str) -> Refused:
+        self.refusals += 1
+        self.last_refusal = reason
+        return Refused(reason)
 
     def _free(self) -> None:
         if self._held:
@@ -215,13 +222,13 @@ class SlowCrawlLimiter:
         while not self._lock.acquire(timeout=0.2):
             reason = self._stop_reason()
             if reason:
-                return Refused(reason)
+                return self._refuse(reason)
         self._held = True
         try:
             reason = self._stop_reason()
             if reason:
                 self._free()
-                return Refused(reason)
+                return self._refuse(reason)
             now = self._mono()
             completion = min(max(0, max_out), int(self._ewma_out) if self._ewma_out else DEFAULT_COMPLETION_TOKENS)
             projected = max(0, est_in) + completion
@@ -229,7 +236,7 @@ class SlowCrawlLimiter:
                          now + self._window_wait(now, projected))
             if self.deadline is not None and target >= self.deadline:
                 self._free()
-                return Refused("MAX_RUNTIME")
+                return self._refuse("MAX_RUNTIME")
             first_wait = target - now
             while True:
                 rem = target - self._mono()
@@ -239,7 +246,7 @@ class SlowCrawlLimiter:
                 reason = self._stop_check()
                 if reason:
                     self._free()
-                    return Refused(reason)
+                    return self._refuse(reason)
             now = self._mono()
             self._last_start, self._last_projected = now, projected
             self._window.append([now, float(projected)])

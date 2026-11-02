@@ -21,6 +21,7 @@ from corpdisc.db.repos.runs import RunRepo
 from corpdisc.graphs.deps import ResearchDeps
 from corpdisc.graphs.finalize import FinalizeGraph, FinalizeResult
 from corpdisc.graphs.research import CommitRejectedError, ResearchGraph, TaskCtx
+from corpdisc.graphs.slow_crawl import SlowCrawlController
 from corpdisc.logging_setup import get_logger
 from corpdisc.models.domain import (
     CrawlState,
@@ -75,9 +76,11 @@ def init_run(repo: RunRepo, settings: Settings, *, run_provider: str | None = No
 
 
 class Supervisor:
-    def __init__(self, deps: ResearchDeps, runs: RunRepo, sleeper: Sleeper | None = None) -> None:
+    def __init__(self, deps: ResearchDeps, runs: RunRepo, sleeper: Sleeper | None = None,
+                 slow: SlowCrawlController | None = None) -> None:
         self.d = deps
         self.runs = runs
+        self.slow = slow  # slow crawl mode hooks; None = the default loop, unchanged
         self.sleeper = sleeper or (deps.clock if isinstance(deps.clock, Sleeper) else None)
         self.research = ResearchGraph(deps)
         self.finalize_graph = FinalizeGraph(deps)
@@ -111,6 +114,10 @@ class Supervisor:
         b = self.d.budget
         if b.degradation_level() == "EXHAUSTED_100":
             return "TOKEN_BUDGET_EXHAUSTED"
+        if self.slow is not None:  # session token / cost ceiling: a session already at the ceiling is denied
+            v = b.check_session(0, 0)
+            if not v.allow:
+                return v.reason or "TOKEN_BUDGET_SLOW_CRAWL_CEILING"
         v = b.check_page("*")  # total-page check runs before the per-domain one
         if not v.allow and v.reason == "TOTAL_PAGE_LIMIT":
             return "TOTAL_PAGE_LIMIT"
@@ -123,10 +130,14 @@ class Supervisor:
         summary = RunSummary(status=RunStatus.RUNNING.value, stopped_reason="")
         breaker = d.runner.gateway.breaker
         idle_waits = 0
+        if self.slow is not None:
+            self.slow.start()
         while True:
             if max_tasks is not None and summary.processed >= max_tasks:
                 summary.stopped_reason = "MAX_TASKS"
                 return self._stop(summary, None, run_finalize=False)
+            if self.slow is not None and (why := self.slow.should_stop()) is not None:  # MAX_RUNTIME / INTERRUPTED
+                return self._slow_pause(summary, why)
             if breaker.state.value == "OPEN":
                 summary.stopped_reason = "CIRCUIT_OPEN"
                 return self._stop(summary, RunStatus.PAUSED, run_finalize=False)
@@ -136,6 +147,12 @@ class Supervisor:
             task = d.queue.claim_next(d.run_id)
             if task is None:
                 ready_at = d.queue.next_ready_time(d.run_id)
+                if ready_at is not None and self.slow is not None:  # slow crawl: sleep until the task is due, then go on
+                    why, waited = self.slow.idle_wait(ready_at)
+                    summary.waited_seconds += waited
+                    if why is not None:
+                        return self._slow_pause(summary, why)
+                    continue
                 if ready_at is not None:  # rescheduled work is waiting: wait if short, else pause (resumable)
                     wait = max(0.0, (ready_at - d.clock.now()).total_seconds())
                     if wait <= d.settings.queue_retry_wait_max_seconds and self.sleeper is not None and idle_waits < 1000:
@@ -156,8 +173,19 @@ class Supervisor:
                           depth=task.depth, parent_entity_id=task.parent_entity_id, attempt=task.attempts,
                           max_attempts=d.queue.max_attempts)
             log.info("Processing entity %s (task %s, depth %s)", task.entity_id, task.task_id, task.depth)
+            if self.slow is not None:
+                self.slow.begin_task()
             try:
                 result = self.research.run(ctx)
+            except KeyboardInterrupt:
+                if self.slow is None:
+                    raise
+                # second signal: whatever the task was doing is abandoned; hand it back with its attempt (D11)
+                if d.conn.in_transaction:
+                    d.conn.rollback()
+                d.queue.release_running(task.task_id)
+                summary.processed -= 1
+                return self._slow_pause(summary, "INTERRUPTED")
             except Exception as exc:  # noqa: BLE001 - one bad task never kills the run
                 log.exception("task %s crashed", task.task_id)
                 d.pages_repo.add_crawl_error(d.run_id, "TASK", type(exc).__name__, str(exc)[:400], entity_id=task.entity_id)
@@ -167,6 +195,16 @@ class Supervisor:
                 summary.outcomes["FAILED" if status.value == "FAILED" else "RETRY"] += 1
                 summary.failed_tasks += status.value == "FAILED"
                 continue
+            if self.slow is not None:
+                self.slow.end_task()
+                if (why := self.slow.refusal()) is not None:
+                    # a request was refused (shutdown / runtime limit) during this task: the graph's result is incomplete
+                    # whatever it says, so put the task back unchanged; its finished chunks come from the response cache
+                    d.queue.release_running(task.task_id)
+                    if self.slow.quota_scope() == "day" and (left := self.slow.limiter.cooldown_remaining()) > 0:
+                        d.queue.defer_all_pending(d.run_id, d.clock.now() + timedelta(seconds=left))  # keep the daily cool-down
+                    summary.processed -= 1
+                    return self._slow_pause(summary, why)
             if breaker.state.value == "OPEN":  # LLM went down mid-task: release the task, pause the run
                 d.queue.defer(task.task_id, d.clock.now())
                 summary.processed -= 1
@@ -176,20 +214,37 @@ class Supervisor:
                 # an HTTP 429 did no model work: wait without using up an attempt, but only a bounded number of times
                 # per task and process, so a provider that never recovers still ends in the attempt-consuming path
                 used = self._rl_deferrals.get(task.task_id, 0)
-                free = result.rate_limited and used < d.settings.queue_max_rate_limit_deferrals
+                slow_rl = self.slow is not None and result.rate_limited  # slow crawl: always attempt-neutral, no deferral cap
+                free = slow_rl or (result.rate_limited and used < d.settings.queue_max_rate_limit_deferrals)
                 if free:
                     self._rl_deferrals[task.task_id] = used + 1
-                delay = max(result.retry_after_s or 0.0, d.settings.queue_retry_base_seconds
-                            * 2 ** (min(used, 4) if free else task.attempts - 1))
+                if slow_rl:
+                    delay = self.slow.rate_limit_delay(result.retry_after_s, hit_429=self.slow.quota_scope() is not None)
+                else:
+                    delay = max(result.retry_after_s or 0.0, d.settings.queue_retry_base_seconds
+                                * 2 ** (min(used, 4) if free else task.attempts - 1))
+                cap = "" if slow_rl else f"/{d.settings.queue_max_rate_limit_deferrals}"
                 reason = (f"{result.retry_reason or 'RETRY_PENDING'} (attempt {task.attempts}/{d.queue.max_attempts}"
-                          + (f", rate limited, deferral {used + 1}/{d.settings.queue_max_rate_limit_deferrals})" if free else ")"))
-                d.queue.reschedule(task.task_id, d.clock.now() + timedelta(seconds=delay), reason,
-                                   consume_attempt=not free)
+                          + (f", rate limited, deferral {used + 1}{cap})" if free else ")"))
+                wake = d.clock.now() + timedelta(seconds=delay)
+                d.queue.reschedule(task.task_id, wake, reason, consume_attempt=not free)
+                if slow_rl and self.slow.quota_scope() == "day":
+                    # the daily quota is gone: nothing else can succeed before it refills, so wait for all pending work
+                    n = d.queue.defer_all_pending(d.run_id, wake)
+                    log.warning("daily quota exhausted: sleeping until %s (%d pending task(s) deferred)",
+                                wake.isoformat(timespec="seconds"), n)
                 log.warning("task %s rescheduled in %.0fs: %s", task.task_id, delay, reason)
                 summary.outcomes["RETRY"] += 1
                 summary.retries += 1
                 summary.processed -= 1  # a retry does not count toward --max-tasks
                 continue
+            if (self.slow is not None and result.outcome == "BUDGET_STOPPED" and result.budget_scope == "run"
+                    and result.errors and "SLOW_CRAWL" in result.errors[-1]):
+                # session ceiling: the ceiling is per session, so the task is handed back for the next session, not skipped
+                d.queue.release_running(task.task_id)
+                summary.processed -= 1
+                summary.stopped_reason = result.errors[-1]
+                return self._stop(summary, RunStatus.BUDGET_EXHAUSTED, run_finalize=run_finalize)
             summary.outcomes[result.outcome] += 1
             self._release(task.task_id, result)
             if result.outcome == "BUDGET_STOPPED" and result.budget_scope == "run":
@@ -229,12 +284,20 @@ class Supervisor:
             return RunStatus.PARTIAL
         return RunStatus.COMPLETED
 
+    def _slow_pause(self, summary: RunSummary, why: str) -> RunSummary:
+        """Slow crawl stop that keeps the run resumable: MAX_RUNTIME or INTERRUPTED. Everything is already in SQLite."""
+        summary.stopped_reason = why
+        summary.queue_detail = self.d.queue.counts_detail(self.d.run_id)
+        return self._stop(summary, RunStatus.PAUSED, run_finalize=False)
+
     def _stop(self, summary: RunSummary, status: RunStatus | None, *, run_finalize: bool) -> RunSummary:
         if run_finalize:
             summary.finalize = self.finalize_graph.run()
         if status is not None:
             self.runs.set_status(self.d.run_id, status)
             summary.status = status.value
+        if self.slow is not None:  # final progress print, after the status is stored
+            self.slow.on_stop(summary.stopped_reason)
         return summary
 
     def resume(self, *, max_tasks: int | None = None) -> RunSummary:
