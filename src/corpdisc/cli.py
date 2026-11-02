@@ -170,7 +170,39 @@ def _check_ollama(settings, model: str | None) -> str | None:  # type: ignore[no
     return None
 
 
-def _print_summary(rt, summary) -> None:  # type: ignore[no-untyped-def]
+def _resume_command(run_id: int, provider: str | None, model: str | None) -> str:
+    """The exact command that continues a slow crawl run."""
+    return (f"python main.py resume --slow-crawl --run-id {run_id}" + (f" --provider {provider}" if provider else "")
+            + (f" --model {model}" if model else "") + " --yes")
+
+
+def _slow_stop_hint(summary, settings, run_id: int, provider: str | None, model: str | None) -> str | None:  # type: ignore[no-untyped-def]
+    """What to do after a slow crawl stopped for a reason other than an empty queue (None for the usual endings)."""
+    reason, cmd = summary.stopped_reason or "", _resume_command(run_id, provider, model)
+    if reason == "MAX_RUNTIME":
+        return (f"The {settings.slow_crawl_max_runtime_hours:g}-hour runtime limit was reached. All progress is saved and "
+                f"waiting tasks keep their retry times. Resume with: {cmd}")
+    if reason == "INTERRUPTED":
+        return f"Stopped on request. The running task was put back on the queue unchanged and all progress is saved. Resume with: {cmd}"
+    if "SLOW_CRAWL" in reason:
+        return (f"The slow crawl session ceiling was reached ({reason}); no further request was sent. Raise "
+                f"SLOW_CRAWL_TOKEN_CEILING or SLOW_CRAWL_COST_CEILING_USD if that is intended, then resume with: {cmd}")
+    return None
+
+
+def _print_slow_banner(settings) -> None:  # type: ignore[no-untyped-def]
+    print(f"Slow crawl mode: one provider request at a time, at least {settings.slow_crawl_interval_seconds:g}s between "
+          "request starts (the gap adapts to token usage and provider limits).")
+    cost = settings.slow_crawl_cost_ceiling_usd
+    print(f"  max runtime {settings.slow_crawl_max_runtime_hours:g} h, session token ceiling {settings.slow_crawl_token_ceiling}, "
+          f"session cost ceiling {'none' if cost is None else f'${cost:g}'}")
+    print("  LLM_RPM_LIMIT and LLM_TPM_LIMIT are ignored in this mode.")
+    if cost is not None and settings.llm_price_in_per_mtok <= 0 and settings.llm_price_out_per_mtok <= 0:
+        print("  WARNING: the cost ceiling is inactive because LLM_PRICE_IN_PER_MTOK and LLM_PRICE_OUT_PER_MTOK are both 0.")
+    print("  Ctrl+C once stops gracefully (progress is saved); twice stops at once. Monitor: python main.py progress --watch 30")
+
+
+def _print_summary(rt, summary, *, slow_hint: str | None = None) -> None:  # type: ignore[no-untyped-def]
     label = run_status_label(summary.status)
     d = summary.queue_detail or {}
     print(f"Run {rt.run_id}: {label} ({summary.stopped_reason}); {summary.processed} tasks, "
@@ -191,7 +223,9 @@ def _print_summary(rt, summary) -> None:  # type: ignore[no-untyped-def]
         "RUNNING": "Stopped early; the run is resumable: python main.py resume",
         "BUDGET_EXHAUSTED": "A budget limit was reached. Raise the limit or resume later: python main.py resume",
     }
-    if summary.status in hints:
+    if slow_hint:
+        print(slow_hint)
+    elif summary.status in hints:
         print(hints[summary.status])
     print("Details: python main.py report")
 
@@ -252,19 +286,55 @@ def _cmd_run(args: argparse.Namespace, *, resume: bool) -> int:
             print("No run to resume. Start one with: python main.py run", file=sys.stderr)
             return EXIT_USAGE
 
-    try:
-        rt = build_runtime(settings, run_id=run_id, run_provider=provider, run_model=model)
-    except (ValueError, DatabaseError) as exc:
-        print(f"Cannot start: {exc}", file=sys.stderr)
-        return EXIT_USAGE
+    lock = flag = None
+    extra: dict = {}
+    if settings.slow_crawl:  # one crawler per database; Ctrl+C / SIGTERM stop gracefully. Flag off: no lock, no handlers.
+        from corpdisc.services.instance_lock import InstanceLock, LockHeld
+        from corpdisc.services.shutdown import ShutdownFlag
+
+        lock = InstanceLock(settings.db_path)
+        try:
+            lock.acquire(run_id=run_id)
+        except LockHeld as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return EXIT_LOCKED
+        if lock.reclaimed_from is not None:
+            print(f"Reclaimed the stale lock of process {lock.reclaimed_from} (it is no longer running).")
+        flag = ShutdownFlag()
+        flag.install()
+        extra = {"stop_check": flag.stop_check, "lock": lock}
+        _print_slow_banner(settings)
 
     try:
-        rt.supervisor.seed_root()
-        summary = rt.supervisor.resume(max_tasks=args.max_tasks) if resume else rt.supervisor.run(max_tasks=args.max_tasks)
-        _print_summary(rt, summary)
-        return RUN_EXIT_CODES.get(summary.status, EXIT_INCOMPLETE)
+        try:
+            rt = build_runtime(settings, run_id=run_id, run_provider=provider, run_model=model, **extra)
+        except (ValueError, DatabaseError) as exc:
+            print(f"Cannot start: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+
+        try:
+            if lock is not None:
+                lock.update(run_id=rt.run_id)
+            rt.supervisor.seed_root()
+            summary = rt.supervisor.resume(max_tasks=args.max_tasks) if resume else rt.supervisor.run(max_tasks=args.max_tasks)
+            hint = _slow_stop_hint(summary, settings, rt.run_id, provider, model) if lock is not None else None
+            _print_summary(rt, summary, slow_hint=hint)
+            if lock is not None and summary.stopped_reason == "INTERRUPTED":
+                return EXIT_INTERRUPTED
+            return RUN_EXIT_CODES.get(summary.status, EXIT_INCOMPLETE)
+        except KeyboardInterrupt:
+            if lock is None:
+                raise
+            print("Interrupted. Progress is saved in the database. Resume with: "
+                  + _resume_command(rt.run_id, provider, model), file=sys.stderr)
+            return EXIT_INTERRUPTED
+        finally:
+            rt.close()
     finally:
-        rt.close()
+        if lock is not None:
+            lock.release()
+        if flag is not None:
+            flag.restore()
 
 
 # ---------------------------------------------------------------------------------------- report / export / verify
