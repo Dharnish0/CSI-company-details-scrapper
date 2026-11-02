@@ -33,9 +33,11 @@ _ERROR_ACCESS_DENIED: Final = 5
 class LockHeld(RuntimeError):
     """Another live slow-crawl process owns the lock (``pid`` is None when the file is unreadable but fresh)."""
 
-    def __init__(self, pid: int | None, path: Path) -> None:
+    def __init__(self, pid: int | None, path: Path, started_at: str | None = None) -> None:
         self.pid, self.path = pid, path
         who = f"process {pid}" if pid is not None else "another process (lock file unreadable, written moments ago)"
+        if pid is not None and started_at:
+            who += f" (lock recorded as started {started_at})"
         super().__init__(f"slow crawl is already running: held by {who}. Lock file: {path}. "
                          "If that process is really gone, delete the lock file and retry.")
 
@@ -121,7 +123,8 @@ class InstanceLock:
         pid = existing.get("pid") if existing else None
         if isinstance(pid, int) and not isinstance(pid, bool):
             if pid_alive(pid):
-                raise LockHeld(pid, self.path)
+                started = existing.get("started_at")
+                raise LockHeld(pid, self.path, started if isinstance(started, str) else None)
             self.reclaimed_from = pid
         else:
             try:

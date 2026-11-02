@@ -49,6 +49,14 @@ def test_old_heartbeat_does_not_override_a_live_pid(tmp_path):
         InstanceLock(db).acquire()
 
 
+def test_refusal_message_shows_recorded_start_time(tmp_path):
+    db = tmp_path / "a.db"
+    _write(db, pid=os.getpid(), started_at="2026-01-02T03:04:05+00:00")
+    with pytest.raises(LockHeld) as ei:
+        InstanceLock(db).acquire()
+    assert "2026-01-02T03:04:05+00:00" in str(ei.value) and str(os.getpid()) in str(ei.value)
+
+
 def test_dead_pid_is_reclaimed(tmp_path):
     db = tmp_path / "a.db"
     dead = _dead_pid()
