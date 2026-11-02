@@ -31,7 +31,7 @@ def test_retry_after_45_then_success_sleeps_exactly_45():
     assert res.requests_used == 1
     assert res.transport_errors == ("RATE_LIMITED",)
     assert gw.breaker.state.value == "CLOSED" and gw.breaker.consecutive_failures == 0
-    assert gw.pacer is None and not hasattr(gw, "limiter")
+    assert gw.pacer is None and getattr(gw, "limiter", None) is None  # no slow-crawl limiter in default mode
 
 
 def test_retry_after_600_reschedules_and_pauses_with_retry_waiting(tmp_path):

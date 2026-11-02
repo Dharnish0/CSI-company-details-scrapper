@@ -6,8 +6,11 @@ injection, so tests substitute fakes and ordinary runs can never reach the netwo
 
 from __future__ import annotations
 
+import random
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
 
 from corpdisc.agents.advisor import AdvisorAgent
@@ -17,12 +20,13 @@ from corpdisc.agents.discovery import DiscoveryAgent
 from corpdisc.agents.extraction import ExtractionAgent
 from corpdisc.agents.gateway import PROVIDER_DEFAULT_LIMITS, CircuitBreaker, GatewayPolicy, LLMGateway, RequestPacer
 from corpdisc.agents.ports import LLMProvider
+from corpdisc.agents.ratelimit import LimiterConfig, SlowCrawlLimiter, TokenBucket
 from corpdisc.agents.providers import build_provider_from_settings
 from corpdisc.agents.relationship import RelationshipAgent
 from corpdisc.agents.runner import AgentRunner, RunnerLimits
 from corpdisc.agents.validation import ValidationAgent
 from corpdisc.agents.website import WebsiteAgent
-from corpdisc.clock import Clock, Sleeper, SystemClock
+from corpdisc.clock import Clock, Sleeper, SystemClock, iso_utc
 from corpdisc.contracts.agents import AgentName
 from corpdisc.config import PROVIDER_MODEL_FIELDS, Settings
 from corpdisc.db.connection import connect_writer, init_db
@@ -33,6 +37,7 @@ from corpdisc.graphs.deps import ResearchDeps
 from corpdisc.graphs.support import AdvisorService, DedupService
 from corpdisc.graphs.supervisor import Supervisor, init_run
 from corpdisc.graphs.tools import make_page_excerpt_spec
+from corpdisc.logging_setup import get_logger
 from corpdisc.services.budget import BudgetGuard, BudgetLimits
 from corpdisc.services.committer import Committer
 from corpdisc.services.confidence import ConfidenceCalculator
@@ -56,6 +61,8 @@ from corpdisc.services.robots import PageRepoRobotsStore, RobotsService
 from corpdisc.services.search import SearchService
 from corpdisc.transport import JsonTransport
 
+log = get_logger("app")
+
 REAL_PROVIDERS = frozenset({"anthropic", "openai", "ollama", "groq", "gemini"})
 
 
@@ -68,6 +75,7 @@ class Runtime:
     supervisor: Supervisor
     provider: LLMProvider
     _closers: list[Any] = field(default_factory=list)
+    limiter: SlowCrawlLimiter | None = None  # set only in slow crawl mode
 
     def close(self) -> None:
         for c in self._closers:
@@ -106,6 +114,23 @@ def make_pacer(settings: Settings, provider_name: str, clock: Clock, sleeper: Sl
     return RequestPacer(rpm=rpm, tpm=tpm, clock=clock, sleeper=sleeper)
 
 
+def make_limiter(settings: Settings, conn: sqlite3.Connection, clock: Clock, sleeper: Sleeper, *,
+                 stop_check: Callable[[], str | None] | None = None, deadline: float | None = None) -> SlowCrawlLimiter:
+    """Slow crawl limiter; the daily-token estimate is seeded from the last 24 h of recorded provider usage."""
+    cfg = LimiterConfig.from_settings(settings)
+    now_mono, now = clock.monotonic(), clock.now()
+    bucket = TokenBucket(cfg.tpd_limit, now_mono)
+    if bucket.enabled:
+        rows = conn.execute(
+            "SELECT started_at, COALESCE(tokens_in,0) + COALESCE(tokens_out,0) FROM agent_invocations "
+            "WHERE cache_hit = 0 AND started_at >= ? AND COALESCE(tokens_in,0) + COALESCE(tokens_out,0) > 0",
+            (iso_utc(now - timedelta(hours=24)),)).fetchall()
+        bucket.replay([((now - datetime.fromisoformat(r[0])).total_seconds(), int(r[1])) for r in rows], now_mono)
+    if deadline is None:
+        deadline = now_mono + settings.slow_crawl_max_runtime_hours * 3600.0
+    return SlowCrawlLimiter(cfg, clock, sleeper, rng=random.Random(), stop_check=stop_check, deadline=deadline, bucket=bucket)
+
+
 def build_runtime(
     settings: Settings,
     *,
@@ -118,6 +143,8 @@ def build_runtime(
     search: SearchService | None = None,
     run_provider: str | None = None,  # Runtime provider override
     run_model: str | None = None,  # Runtime model override
+    stop_check: Callable[[], str | None] | None = None,  # slow crawl: returns a stop reason (e.g. "SHUTDOWN") or None
+    deadline: float | None = None,  # slow crawl: monotonic deadline; default = now + SLOW_CRAWL_MAX_RUNTIME_HOURS
 ) -> Runtime:
     """Wire everything. ``run_id=None`` creates a new run; pass an id to resume one. Never touches the network.
     
@@ -132,6 +159,8 @@ def build_runtime(
         search: Search service (optional)
         run_provider: Override provider for this run (e.g., "groq")
         run_model: Override model for this run (e.g., "openai/gpt-oss-120b")
+        stop_check: Slow crawl only. Polled while the limiter waits; a non-empty reason stops new provider requests.
+        deadline: Slow crawl only. Monotonic time after which no new provider request starts.
     """
     init_db(settings.db_path)
     conn = connect_writer(settings.db_path)
@@ -179,9 +208,17 @@ def build_runtime(
     if renderer is not None:
         closers.append(fetch)
 
+    limiter = None
+    if settings.slow_crawl:
+        limiter = make_limiter(settings, conn, clock, sleeper, stop_check=stop_check, deadline=deadline)
+        pacer = None  # the limiter replaces the RPM/TPM pacer (double sleeping would only add waits)
+        log.info("slow crawl: LLM_RPM_LIMIT and LLM_TPM_LIMIT are ignored; one request at a time, %.0fs between starts",
+                 settings.slow_crawl_interval_seconds)
+    else:
+        pacer = make_pacer(settings, effective_provider or getattr(provider, "name", ""), clock, sleeper)
     gateway = LLMGateway(provider, model=model, policy=GatewayPolicy.from_settings(settings),
                          breaker=CircuitBreaker(settings.llm_breaker_threshold), budget=budget, clock=clock, sleeper=sleeper,
-                         pacer=make_pacer(settings, effective_provider or getattr(provider, "name", ""), clock, sleeper))
+                         pacer=pacer, limiter=limiter)
     audit = SqliteAuditSink(conn)
     broker = ToolBroker([make_page_excerpt_spec(pages, cache, run_id)], audit=audit, clock=clock, budget=budget)
     runner = AgentRunner(gateway=gateway, audit=audit, cache=SqliteResponseCache(conn), budget=budget, broker=broker,
@@ -198,4 +235,4 @@ def build_runtime(
                 "website": WebsiteAgent(), "advisor": AdvisorAgent(), "dedup": DedupAgent(), "validation": ValidationAgent()},
         advisor=AdvisorService() if settings.advisor_enabled else None, dedup=DedupService(), search=search,
         export_path=settings.output_xlsx)
-    return Runtime(settings, conn, run_id, deps, Supervisor(deps, runs, sleeper), provider, closers)
+    return Runtime(settings, conn, run_id, deps, Supervisor(deps, runs, sleeper), provider, closers, limiter)

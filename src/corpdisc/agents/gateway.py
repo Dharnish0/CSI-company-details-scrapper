@@ -25,6 +25,7 @@ from corpdisc.agents.ports import (
     ProviderResponse,
     Sleeper,
 )
+from corpdisc.agents.ratelimit import Refused, SlowCrawlLimiter, classify_429
 from corpdisc.config import Settings
 from corpdisc.contracts.agents import AgentName, FailureKind
 from corpdisc.logging_setup import get_logger
@@ -181,6 +182,7 @@ class GatewayFailure:
     retryable: bool = False  # transient: the same work may succeed later (429, timeout, 5xx)
     retry_after_s: float | None = None
     rate_limited: bool = False  # HTTP 429 (not an outage): no model work was done
+    quota_scope: str | None = None  # slow crawl only: "minute" or "day" for a 429, else None
 
 
 @dataclass(frozen=True)
@@ -195,7 +197,7 @@ class GatewayResult:
 class LLMGateway:
     def __init__(self, provider: LLMProvider, *, model: str, policy: GatewayPolicy, breaker: CircuitBreaker,
                  budget: BudgetPort | None, clock: Clock, sleeper: Sleeper, rng: random.Random | None = None,
-                 pacer: RequestPacer | None = None) -> None:
+                 pacer: RequestPacer | None = None, limiter: SlowCrawlLimiter | None = None) -> None:
         self._provider = provider
         self._model = model
         self.policy = policy
@@ -205,6 +207,7 @@ class LLMGateway:
         self._sleeper = sleeper
         self._rng = rng or random.Random(0)
         self.pacer = pacer
+        self.limiter = limiter  # slow crawl: global single-flight limiter; None = default behaviour
 
     @property
     def provider_name(self) -> str:
@@ -247,9 +250,18 @@ class LLMGateway:
             est = estimate_tokens(request.system + "".join(m.content for m in request.messages)) + request.max_output_tokens
             if self.pacer is not None:
                 self.pacer.wait(est)
+            scope: str | None = None
+            if self.limiter is not None:
+                acquired = self.limiter.acquire(est - request.max_output_tokens, request.max_output_tokens)
+                if isinstance(acquired, Refused):  # shutdown or runtime limit: nothing was sent, the breaker is untouched
+                    return GatewayResult(None, GatewayFailure(FailureKind.TRANSPORT, f"slow crawl: request not started "
+                                                              f"({acquired.reason})", retryable=True),
+                                         max(0, used - 1 - rl_used), ms(), tuple(errors))
             try:
                 resp = self._provider.complete(request)
             except ProviderAuthError as exc:
+                if self.limiter is not None:
+                    self.limiter.release_error()
                 self.breaker.record_failure(auth=True)
                 log.error("LLM provider auth failure (%s); breaker open", type(exc).__name__)
                 return GatewayResult(None, GatewayFailure(FailureKind.TRANSPORT, "provider auth failure", auth=True),
@@ -260,6 +272,16 @@ class LLMGateway:
                     # 429: no model work was done and the provider is healthy, so it neither opens the breaker nor
                     # consumes the invocation's request budget. Honour Retry-After up to the configured ceiling.
                     rl_used += 1
+                    if self.limiter is not None:
+                        # slow crawl: the limiter owns the wait (cooldown >= Retry-After); a daily quota is not retried here
+                        scope = classify_429(exc.detail, exc.retry_after_s)
+                        self.limiter.release_429(scope, exc.retry_after_s, exc.rl_metrics)
+                        if scope == "day":
+                            log.warning("rate limited (429): daily quota; deferring the work")
+                            return GatewayResult(None, GatewayFailure(FailureKind.TRANSPORT, str(exc)[:300], retryable=True,
+                                                                      retry_after_s=exc.retry_after_s, rate_limited=True,
+                                                                      quota_scope=scope),
+                                                 used - rl_used, ms(), tuple(errors))
                     wait_s = self._backoff(rl_used - 1, exc.retry_after_s)
                     if self.pacer is not None:
                         self.pacer.penalize(wait_s)
@@ -267,17 +289,21 @@ class LLMGateway:
                         log.warning("rate limited: Retry-After %.0fs exceeds the %.0fs ceiling; deferring the work",
                                     exc.retry_after_s, self.policy.retry_after_ceiling)
                         return GatewayResult(None, GatewayFailure(FailureKind.TRANSPORT, str(exc)[:300], retryable=True,
-                                                                  retry_after_s=exc.retry_after_s, rate_limited=True),
+                                                                  retry_after_s=exc.retry_after_s, rate_limited=True,
+                                                                  quota_scope=scope),
                                              used - rl_used, ms(), tuple(errors))
                     if rl_used <= self.policy.rate_limit_retries:
                         log.info("rate limited (429): sleeping %.1fs before retry %d/%d", wait_s, rl_used,
                                  self.policy.rate_limit_retries)
-                        self._sleeper.sleep(wait_s)
-                        continue
+                        if self.limiter is None:
+                            self._sleeper.sleep(wait_s)
+                        continue  # slow crawl: the next acquire() waits out the limiter cooldown
                     return GatewayResult(None, GatewayFailure(FailureKind.TRANSPORT, f"rate limited: {str(exc)[:250]}",
                                                               retryable=True, retry_after_s=exc.retry_after_s,
-                                                              rate_limited=True),
+                                                              rate_limited=True, quota_scope=scope),
                                          used - rl_used, ms(), tuple(errors))
+                if self.limiter is not None:
+                    self.limiter.release_error()
                 if exc.retryable and used - rl_used <= self.policy.transport_retries and used - rl_used < max_requests:
                     self._sleeper.sleep(min(self._backoff(used - rl_used - 1, exc.retry_after_s), self.policy.retry_after_ceiling))
                     continue
@@ -286,10 +312,18 @@ class LLMGateway:
                                                           retry_after_s=exc.retry_after_s),
                                      used - rl_used, ms(), tuple(errors))
             except Exception as exc:  # noqa: BLE001 - a provider bug must not escape
+                if self.limiter is not None:
+                    self.limiter.release_error()
                 errors.append(type(exc).__name__)
                 self.breaker.record_failure()
                 return GatewayResult(None, GatewayFailure(FailureKind.TRANSPORT, f"provider error {type(exc).__name__}"),
                                      used - rl_used, ms(), tuple(errors))
+            except BaseException:  # KeyboardInterrupt etc.: free the slot, then let it propagate
+                if self.limiter is not None:
+                    self.limiter.release_error()
+                raise
+            if self.limiter is not None:
+                self.limiter.release_success(resp.metrics, resp.usage.tokens_in, resp.usage.tokens_out)
             self.breaker.record_success()
             if self.pacer is not None:
                 self.pacer.observe(resp.metrics, est)
