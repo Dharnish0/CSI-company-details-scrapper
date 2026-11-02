@@ -102,7 +102,7 @@ def classify(reply: HttpReply, *, provider: str, secret: str | None) -> Provider
         return ProviderAuthError(f"{provider} auth/quota error {s}: {detail}")
     if s == 429 or s == 408 or s >= 500 or s == 529:
         return ProviderTransportError(f"{provider} transient error {s}", retryable=True, retry_after_s=retry_after(reply.headers),
-                                       rate_limited=s == 429)
+                                       rate_limited=s == 429, detail=detail, rl_metrics=ratelimit_metrics(reply.headers))
     return ProviderTransportError(f"{provider} rejected the request ({s}): {detail}", retryable=False)
 
 
